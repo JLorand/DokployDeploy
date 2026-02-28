@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="DokployDeploy.ApiService/DokployDeploy.ApiService.csproj" />
+  <Project Path="DokployDeploy.AppHost/DokployDeploy.AppHost.csproj" />
+  <Project Path="DokployDeploy.ServiceDefaults/DokployDeploy.ServiceDefaults.csproj" />
+  <Project Path="DokployDeploy.Tests/DokployDeploy.Tests.csproj" />
+  <Project Path="DokployDeploy.Web/DokployDeploy.Web.csproj" />
+</Solution>

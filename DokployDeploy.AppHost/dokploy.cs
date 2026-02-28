@@ -1,0 +1,1368 @@
+using Aspire.Hosting.Pipelines;
+using Aspire.Hosting.Publishing;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System.Linq;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
+
+public static class DokployExtensions
+{
+    private const string DokployRegistryProjectName = "DokployRegistry";
+
+
+    public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProject(this IDistributedApplicationBuilder builder, string name)
+    {
+
+        if (builder.ExecutionContext.IsRunMode)
+        {
+            return builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name, null!));
+        }
+#pragma warning disable ASPIREINTERACTION001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+        var apikey = builder.AddParameter($"{name}-apiKey", secret: true)
+            .WithCustomInput(ctx => new()
+            {
+                InputType = InputType.SecretText,
+                Name = $"API Key for {name}",
+                Required = true,
+                Placeholder = "CoolApiKey123"
+            });
+#pragma warning restore ASPIREINTERACTION001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+
+        var x = builder.AddResource(new DokployProjectEnvironmentResource(name, apikey.Resource));
+
+        builder.Eventing.Subscribe<BeforeStartEvent>(async (e, ct) =>
+        {
+            var rscs = e.Model.GetComputeResources();
+            foreach (var rsc in rscs)
+            {
+#pragma warning disable ASPIRECOMPUTE003 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+                rsc.Annotations.Add(new RegistryTargetAnnotation(x.Resource));
+#pragma warning restore ASPIRECOMPUTE003 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+
+
+            }
+        });
+        
+        return x;
+    }
+}
+
+public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
+{
+    private readonly string _name;
+    public DokployProjectEnvironmentResource(string name, ParameterResource apikey) : base(name)
+    {
+        _name = name;
+
+#pragma warning disable ASPIREPIPELINES001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+        Annotations.Add(new PipelineStepAnnotation(ctx =>
+        {
+           return [new PipelineStep() {
+               Name = $"prepare-registry-{name}",
+               Action = async ctx => {
+                var apiKeyVal = await apikey.GetValueAsync(ctx.CancellationToken) ?? throw new Exception($"API key for project {name} is not set."); 
+                ctx.Logger.LogInformation("Deploying project {ProjectName} with API key {ApiKey}", name, apiKeyVal?.Substring(0, 4) + "****" + apiKeyVal?.Substring(apiKeyVal.Length - 4));
+                // TODO: Add the api url as a parameter later
+                var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger);
+
+                // We create a project for the given apphost
+                var projectName = $"{name}-project";
+                var proj = await api.GetProjectOrCreateAsync(projectName);
+                ctx.Logger.LogInformation("Project {ProjectName} exists.", proj.Name);
+
+                // We register a docker registry and wire it up
+                var registry = await api.GetOrCreateRegistryAsync(proj);
+                ContainerRegistryUrl = registry.RegistryUrl;
+                ctx.Logger.LogInformation("Registry for project {ProjectName} is ready.", proj.Name);
+
+                // We login with the container runtime
+#pragma warning disable ASPIRECONTAINERRUNTIME001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+                var containerRuntime = ctx.Services.GetRequiredService<IContainerRuntime>();
+#pragma warning restore ASPIRECONTAINERRUNTIME001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+                await containerRuntime.LoginToRegistryAsync(registry.RegistryUrl, "docker", "password", ctx.CancellationToken);
+                
+
+
+                // 
+
+               },
+               RequiredBySteps = [WellKnownPipelineSteps.Deploy],
+               DependsOnSteps = [WellKnownPipelineSteps.DeployPrereq]
+           }, new PipelineStep() {
+               Name = $"provision-apps-{name}",
+               Action = async ctx => {
+                    var api = new DokployApi(await apikey.GetValueAsync(ctx.CancellationToken) ?? throw new Exception($"API key for project {name} is not set."), "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger);
+                    var rscs = ctx.Model.GetComputeResources();
+
+                    List<DokployApi.Application> applications = new();
+
+                    foreach (var rsc in rscs)
+                    {
+                        // Get or create call
+                        var application = await api.GetOrCreateApplication($"{name}-app-{rsc.Name}", $"{name}-project", (IComputeResource)rsc);
+                        applications.Add(application);
+                    }
+
+
+
+               },
+               DependsOnSteps = [WellKnownPipelineSteps.Push, $"prepare-registry-{name}"],
+               RequiredBySteps = [WellKnownPipelineSteps.Deploy]
+           }
+           ]; 
+        }));
+#pragma warning restore ASPIREPIPELINES001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
+    }
+
+    private string? ContainerRegistryUrl = null;
+    public ReferenceExpression Endpoint => ReferenceExpression.Create($"{ContainerRegistryUrl}");
+
+    ReferenceExpression IContainerRegistry.Name => ReferenceExpression.Create($"{_name}-registry");
+}
+
+public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger logger)
+{
+    private const string RegistryDomain = "aspirecli.dev";
+    private const string RegistryUsername = "docker";
+    private const string RegistryPassword = "password";
+
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
+    public async Task<Project> GetProjectOrCreateAsync(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new ArgumentException("Project id/name must be provided.", nameof(name));
+        }
+
+        using var http = CreateHttpClient();
+
+        // Query all projects and match by name so we can keep the real project id from Dokploy.
+        using var allResponse = await http.GetAsync("api/project.all");
+        if (allResponse.IsSuccessStatusCode)
+        {
+            var existing = await FindProjectByNameFromResponseAsync(allResponse, name);
+            if (existing is not null)
+            {
+                logger.LogInformation("Project {ProjectName} already exists with id {ProjectId}.", existing.Name, existing.Id);
+                return existing;
+            }
+        }
+
+        logger.LogInformation("Project {ProjectName} not found. Creating new project.", name);
+
+        var createBody = JsonSerializer.Serialize(new
+        {
+            name = name,
+            description = "Project created from Aspire hosting environment.",
+            env = env.EnvironmentName
+        }, JsonOptions);
+
+        // TODO: Use Httpclient json extension methods
+        using var createResponse = await http.PostAsync("api/project.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
+
+        logger.LogInformation("Create project response: {StatusCode} - {ReasonPhrase}", createResponse.StatusCode, createResponse.ReasonPhrase);
+
+        createResponse.EnsureSuccessStatusCode();
+
+        return await ReadProjectFromResponseAsync(createResponse)
+            ?? throw new InvalidOperationException($"Dokploy returned success for project '{name}', but no project payload was found.");
+    }
+
+    private HttpClient CreateHttpClient()
+    {
+        var baseUrl = url.EndsWith("/", StringComparison.Ordinal) ? url : $"{url}/";
+        var http = new HttpClient
+        {
+            BaseAddress = new Uri(baseUrl, UriKind.Absolute)
+        };
+
+        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        http.DefaultRequestHeaders.Add("x-api-key", apiKey);
+        return http;
+    }
+
+    private static async Task<Project?> ReadProjectFromResponseAsync(HttpResponseMessage response)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        return TryExtractProject(json.RootElement);
+    }
+
+    private static async Task<Project?> FindProjectByNameFromResponseAsync(HttpResponseMessage response, string expectedName)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        return FindProjectByName(json.RootElement, expectedName);
+    }
+
+    private static Project? TryExtractProject(JsonElement root)
+    {
+        if (TryDeserializeProject(root, out var directProject))
+        {
+            return directProject;
+        }
+
+        if (root.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var key in new[] { "project", "data", "result" })
+            {
+                if (root.TryGetProperty(key, out var nested) && TryDeserializeProject(nested, out var nestedProject))
+                {
+                    return nestedProject;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryDeserializeProject(JsonElement value, out Project? project)
+    {
+        project = null;
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!value.TryGetProperty("name", out _))
+        {
+            return false;
+        }
+
+        project = value.Deserialize<Project>(JsonOptions);
+        return project is not null;
+    }
+
+    private static Project? FindProjectByName(JsonElement value, string expectedName)
+    {
+        if (TryDeserializeProject(value, out var candidate) && string.Equals(candidate?.Name, expectedName, StringComparison.OrdinalIgnoreCase))
+        {
+            return candidate;
+        }
+
+        if (value.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in value.EnumerateArray())
+            {
+                var match = FindProjectByName(item, expectedName);
+                if (match is not null)
+                {
+                    return match;
+                }
+            }
+        }
+
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in value.EnumerateObject())
+            {
+                var match = FindProjectByName(prop.Value, expectedName);
+                if (match is not null)
+                {
+                    return match;
+                }
+            }
+        }
+
+        return null;
+    }
+
+
+    internal async Task<Registry> GetOrCreateRegistryAsync(Project proj)
+    {
+        ArgumentNullException.ThrowIfNull(proj);
+        if (string.IsNullOrWhiteSpace(proj.Id))
+        {
+            throw new InvalidOperationException($"Project '{proj.Name}' has no id. Cannot create registry compose resource without project id.");
+        }
+
+        using var http = CreateHttpClient();
+
+        // Refresh project details so we inspect the latest environments and compose resources.
+        using var projectResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(proj.Id)}");
+        projectResponse.EnsureSuccessStatusCode();
+
+        var refreshedProject = await ReadProjectFromResponseAsync(projectResponse)
+            ?? throw new InvalidOperationException($"Could not parse project details for project id '{proj.Id}'.");
+
+        var targetEnvironment = refreshedProject.Environments
+            .FirstOrDefault(e => string.Equals(e.Name, "production", StringComparison.OrdinalIgnoreCase))
+            ?? refreshedProject.Environments.FirstOrDefault();
+
+        if (targetEnvironment is null || string.IsNullOrWhiteSpace(targetEnvironment.Id))
+        {
+            throw new InvalidOperationException($"Project '{refreshedProject.Name}' has no usable environment (expected one named 'production').");
+        }
+
+        var existingRegistry = targetEnvironment.Compose
+            .FirstOrDefault(c => string.Equals(c.Name, "registry", StringComparison.OrdinalIgnoreCase));
+
+        if (existingRegistry is not null)
+        {
+            var existingRegistryDetails = await GetComposeDetailsAsync(http, existingRegistry);
+            await DeployComposeAsync(http, existingRegistryDetails);
+            var linkedRegistry = await EnsureRegistryLinkedAsync(http, refreshedProject, targetEnvironment, existingRegistryDetails);
+
+            logger.LogInformation("Registry compose already exists for project {ProjectName} in environment {EnvironmentName}.", refreshedProject.Name, targetEnvironment.Name);
+            return new Registry
+            {
+                RegistryId = linkedRegistry?.RegistryId,
+                RegistryUrl = linkedRegistry?.RegistryUrl ?? GetRegistryUrl(),
+                ProjectId = refreshedProject.Id,
+                EnvironmentId = targetEnvironment.Id,
+                ComposeId = existingRegistryDetails.Id ?? existingRegistry.Id,
+                Name = existingRegistryDetails.Name
+            };
+        }
+
+        var deployBody = JsonSerializer.Serialize(new
+        {
+            environmentId = targetEnvironment.Id,
+            id = "registry"
+        }, JsonOptions);
+
+        using var deployResponse = await http.PostAsync("api/compose.deployTemplate", new StringContent(deployBody, Encoding.UTF8, "application/json"));
+        deployResponse.EnsureSuccessStatusCode();
+
+        var deployedCompose = await ReadComposeFromResponseAsync(deployResponse);
+        if (deployedCompose is not null)
+        {
+            logger.LogInformation("Registry compose deployment accepted for project {ProjectName}. Verifying via project.one.", refreshedProject.Name);
+        }
+
+        // Fallback for APIs that return ack-only payloads: refetch project and locate compose there.
+        using var verifyResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(proj.Id)}");
+        verifyResponse.EnsureSuccessStatusCode();
+
+        var verifiedProject = await ReadProjectFromResponseAsync(verifyResponse)
+            ?? throw new InvalidOperationException($"Registry deploy completed but project '{proj.Name}' could not be reloaded for verification.");
+
+        var verifiedEnvironment = verifiedProject.Environments
+            .FirstOrDefault(e => string.Equals(e.Name, targetEnvironment.Name, StringComparison.OrdinalIgnoreCase));
+
+        var verifiedRegistry = verifiedEnvironment?.Compose
+            .FirstOrDefault(c => string.Equals(c.Name, "registry", StringComparison.OrdinalIgnoreCase));
+
+        if (verifiedRegistry is null)
+        {
+            throw new InvalidOperationException($"Registry compose deploy returned success but no 'registry' compose was found for project '{verifiedProject.Name}'.");
+        }
+
+        var verifiedRegistryDetails = await GetComposeDetailsAsync(http, verifiedRegistry);
+        await DeployComposeAsync(http, verifiedRegistryDetails);
+        var linkedVerifiedRegistry = await EnsureRegistryLinkedAsync(http, verifiedProject, verifiedEnvironment, verifiedRegistryDetails);
+
+        return new Registry
+        {
+            RegistryId = linkedVerifiedRegistry?.RegistryId,
+            RegistryUrl = linkedVerifiedRegistry?.RegistryUrl ?? GetRegistryUrl(),
+            ProjectId = verifiedProject.Id,
+            EnvironmentId = verifiedEnvironment?.Id,
+            ComposeId = verifiedRegistryDetails.Id ?? verifiedRegistry.Id,
+            Name = verifiedRegistryDetails.Name
+        };
+    }
+
+    private async Task<Compose> GetComposeDetailsAsync(HttpClient http, Compose compose)
+    {
+        if (string.IsNullOrWhiteSpace(compose.Id))
+        {
+            throw new InvalidOperationException($"Compose '{compose.Name}' does not have composeId, so compose.one cannot be called.");
+        }
+
+        using var composeResponse = await http.GetAsync($"api/compose.one?composeId={Uri.EscapeDataString(compose.Id)}");
+        composeResponse.EnsureSuccessStatusCode();
+
+        var fullCompose = await ReadComposeFromResponseAsync(composeResponse)
+            ?? throw new InvalidOperationException($"compose.one returned success but no compose payload for composeId '{compose.Id}'.");
+
+        return fullCompose;
+    }
+
+    private async Task DeployComposeAsync(HttpClient http, Compose compose)
+    {
+        if (string.IsNullOrWhiteSpace(compose.Id))
+        {
+            throw new InvalidOperationException($"Compose '{compose.Name}' does not have composeId, so compose.deploy cannot be called.");
+        }
+
+        var deployBody = JsonSerializer.Serialize(new
+        {
+            composeId = compose.Id,
+            title = $"Aspire deploy for {compose.Name}",
+            description = "Started automatically before registry link verification."
+        }, JsonOptions);
+
+        using var deployResponse = await http.PostAsync("api/compose.deploy", new StringContent(deployBody, Encoding.UTF8, "application/json"));
+        logger.LogInformation("Compose deploy response for {ComposeName}: {StatusCode} - {ReasonPhrase}", compose.Name, deployResponse.StatusCode, deployResponse.ReasonPhrase);
+        deployResponse.EnsureSuccessStatusCode();
+    }
+
+    private static async Task<Compose?> ReadComposeFromResponseAsync(HttpResponseMessage response)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        return TryExtractCompose(json.RootElement);
+    }
+
+    private static Compose? TryExtractCompose(JsonElement root)
+    {
+        if (TryDeserializeCompose(root, out var directCompose))
+        {
+            return directCompose;
+        }
+
+        if (root.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var key in new[] { "compose", "data", "result" })
+            {
+                if (root.TryGetProperty(key, out var nested) && TryDeserializeCompose(nested, out var nestedCompose))
+                {
+                    return nestedCompose;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryDeserializeCompose(JsonElement value, out Compose? compose)
+    {
+        compose = null;
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!value.TryGetProperty("name", out _))
+        {
+            return false;
+        }
+
+        compose = value.Deserialize<Compose>(JsonOptions);
+        return compose is not null;
+    }
+
+    private async Task<RemoteRegistry?> EnsureRegistryLinkedAsync(HttpClient http, Project project, Environment? environment, Compose compose)
+    {
+        var registryUrl = GetRegistryUrl();
+        var username = RegistryUsername;
+        var password = RegistryPassword;
+
+        var testInput = new RegistryRequestPayload
+        {
+            RegistryName = compose.Name,
+            Username = username,
+            Password = password,
+            RegistryUrl = registryUrl,
+            RegistryType = "cloud"
+        };
+
+        var existingRegistry = await FindExistingRegistryAsync(http, testInput);
+        if (existingRegistry is not null)
+        {
+            logger.LogInformation("Registry URL {RegistryUrl} already exists as registryId {RegistryId}.", registryUrl, existingRegistry.RegistryId);
+
+            
+
+            return existingRegistry;
+        }
+
+        var works = await TestRegistryLinkedAsync(http, testInput, logger);
+        if (!works)
+        {
+            logger.LogInformation("Registry URL {RegistryUrl} is not yet valid in Dokploy. Will attempt creation.", registryUrl);
+        }
+
+        var createBody = JsonSerializer.Serialize(new
+        {
+            registryName = compose.Name,
+            username,
+            password,
+            registryUrl,
+            registryType = "cloud",
+            imagePrefix = registryUrl
+        }, JsonOptions);
+
+        using var createResponse = await http.PostAsync("api/registry.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
+
+        logger.LogInformation("Create registry response: {StatusCode} - {ReasonPhrase}", createResponse.StatusCode, createResponse.ReasonPhrase);
+
+        createResponse.EnsureSuccessStatusCode();
+        logger.LogInformation("Created Dokploy registry entry for {RegistryUrl}.", registryUrl);
+
+        var createdRegistry = await ReadRegistryFromResponseAsync(createResponse);
+        if (createdRegistry is not null)
+        {
+            return createdRegistry;
+        }
+
+        // Some APIs return ack-only payloads; resolve ID via a fresh list query.
+        return await FindExistingRegistryAsync(http, testInput);
+    }
+
+    private static async Task<RemoteRegistry?> FindExistingRegistryAsync(HttpClient http, RegistryRequestPayload payload)
+    {
+        using var allResponse = await http.GetAsync("api/registry.all");
+        allResponse.EnsureSuccessStatusCode();
+
+        var registries = await ReadRegistriesFromResponseAsync(allResponse);
+        return registries.FirstOrDefault(r =>
+            string.Equals(r.RegistryUrl, payload.RegistryUrl, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(r.Username, payload.Username, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(r.RegistryName, payload.RegistryName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static async Task<List<RemoteRegistry>> ReadRegistriesFromResponseAsync(HttpResponseMessage response)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        var output = new List<RemoteRegistry>();
+        CollectRegistries(json.RootElement, output);
+        return output;
+    }
+
+    private static async Task<RemoteRegistry?> ReadRegistryFromResponseAsync(HttpResponseMessage response)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        return TryExtractRegistry(json.RootElement);
+    }
+
+    private static RemoteRegistry? TryExtractRegistry(JsonElement element)
+    {
+        if (TryDeserializeRegistry(element, out var registry))
+        {
+            return registry;
+        }
+
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var key in new[] { "registry", "data", "result" })
+            {
+                if (element.TryGetProperty(key, out var nested))
+                {
+                    var nestedRegistry = TryExtractRegistry(nested);
+                    if (nestedRegistry is not null)
+                    {
+                        return nestedRegistry;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static void CollectRegistries(JsonElement element, List<RemoteRegistry> output)
+    {
+        if (TryDeserializeRegistry(element, out var registry))
+        {
+            output.Add(registry);
+        }
+
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in element.EnumerateObject())
+            {
+                CollectRegistries(prop.Value, output);
+            }
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                CollectRegistries(item, output);
+            }
+        }
+    }
+
+    private static bool TryDeserializeRegistry(JsonElement value, out RemoteRegistry registry)
+    {
+        registry = new RemoteRegistry();
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!value.TryGetProperty("registryUrl", out _))
+        {
+            return false;
+        }
+
+        var candidate = value.Deserialize<RemoteRegistry>(JsonOptions);
+        if (candidate is null)
+        {
+            return false;
+        }
+
+        registry = candidate;
+        return true;
+    }
+
+    private static async Task<bool> TestRegistryLinkedAsync(HttpClient http, RegistryRequestPayload payload, ILogger? logger = null)
+    {
+        var testBody = JsonSerializer.Serialize(new
+        {
+            registryName = payload.RegistryName,
+            username = payload.Username,
+            password = payload.Password,
+            registryUrl = payload.RegistryUrl,
+            registryType = payload.RegistryType
+        }, JsonOptions);
+
+        // TODO: BTW we should probably check if compose is running before trying to start it I GUESS
+
+        logger?.LogInformation("Testing if registry URL {payload} is linked in Dokploy.", testBody);
+        using var testResponse = await http.PostAsync("api/registry.testRegistry", new StringContent(testBody, Encoding.UTF8, "application/json"));
+        logger?.LogInformation("Test registry response: {StatusCode} - {ReasonPhrase}", testResponse.StatusCode, await testResponse.Content.ReadAsStringAsync());
+        
+        testResponse.EnsureSuccessStatusCode();
+
+        await using var stream = await testResponse.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        return ExtractLinkState(json.RootElement);
+    }
+
+    private static bool ExtractLinkState(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.True)
+        {
+            return true;
+        }
+
+        if (element.ValueKind == JsonValueKind.False)
+        {
+            return false;
+        }
+
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var key in new[] { "linked", "isLinked", "exists", "registered", "success", "data" })
+            {
+                if (element.TryGetProperty(key, out var nested))
+                {
+                    var nestedResult = ExtractLinkState(nested);
+                    if (nestedResult)
+                    {
+                        return true;
+                    }
+
+                    if (nested.ValueKind == JsonValueKind.False)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            foreach (var prop in element.EnumerateObject())
+            {
+                var nestedResult = ExtractLinkState(prop.Value);
+                if (nestedResult)
+                {
+                    return true;
+                }
+            }
+        }
+
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (ExtractLinkState(item))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private sealed class RegistryRequestPayload
+    {
+        public string RegistryName { get; init; } = string.Empty;
+        public string Username { get; init; } = string.Empty;
+        public string Password { get; init; } = string.Empty;
+        public string RegistryUrl { get; init; } = string.Empty;
+        public string RegistryType { get; init; } = string.Empty;
+    }
+
+    private static string GetRegistryUrl()
+    {
+        return RegistryDomain;
+    }
+
+    private static string GetRegistryUsernameFromCompose(Compose compose)
+    {
+        var composeFile = NormalizeTemplateText(compose.ComposeFile);
+        if (string.IsNullOrWhiteSpace(composeFile))
+        {
+            throw new InvalidOperationException($"Compose '{compose.Name}' has no compose file content to extract registry username from.");
+        }
+
+        // Try common YAML keys that store a registry username.
+        var keyMatch = Regex.Match(composeFile, @"(?im)^\s*(REGISTRY_USERNAME|REGISTRY_USER|USERNAME)\s*[:=]\s*""?([^""\r\n#]+)");
+        if (keyMatch.Success)
+        {
+            return keyMatch.Groups[2].Value.Trim();
+        }
+
+        // Some Dokploy templates expose auth mode as REGISTRY_AUTH (for example: htpasswd).
+        var authModeMatch = Regex.Match(composeFile, @"(?im)^\s*REGISTRY_AUTH\s*[:=]\s*""?([^""\r\n#]+)");
+        if (authModeMatch.Success)
+        {
+            return authModeMatch.Groups[1].Value.Trim();
+        }
+
+        // Fallback: look for basic auth url patterns like user@host.
+        var userAtHost = Regex.Match(composeFile, @"(?i)\b([a-z0-9._-]+)@[a-z0-9.-]+\b");
+        if (userAtHost.Success)
+        {
+            return userAtHost.Groups[1].Value.Trim();
+        }
+
+        throw new InvalidOperationException($"Could not extract registry username from compose file for compose '{compose.Name}'.");
+    }
+
+    private static string NormalizeTemplateText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return text;
+        }
+
+        // Dokploy may return template content with escaped newlines.
+        return text.Replace("\\r\\n", "\n", StringComparison.Ordinal)
+                   .Replace("\\n", "\n", StringComparison.Ordinal)
+                   .Replace("\\r", "\n", StringComparison.Ordinal);
+    }
+
+    private static string GetRequiredEnvValue(string envText, string key)
+    {
+        if (string.IsNullOrWhiteSpace(envText))
+        {
+            throw new InvalidOperationException($"Compose env is empty; required key '{key}' was not found.");
+        }
+
+        var lines = envText.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("#", StringComparison.Ordinal) || !trimmed.Contains('='))
+            {
+                continue;
+            }
+
+            var idx = trimmed.IndexOf('=');
+            var lineKey = trimmed[..idx].Trim();
+            if (!string.Equals(lineKey, key, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var value = trimmed[(idx + 1)..].Trim();
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                return value.Trim('"');
+            }
+        }
+
+        throw new InvalidOperationException($"Required env key '{key}' was not found in compose env values.");
+    }
+
+    internal async Task<Application> GetOrCreateApplication(string appName, string projectName, IComputeResource rsc)
+    {
+        if (string.IsNullOrWhiteSpace(appName))
+        {
+            throw new ArgumentException("Application name must be provided.", nameof(appName));
+        }
+
+        if (string.IsNullOrWhiteSpace(projectName))
+        {
+            throw new ArgumentException("Project name must be provided.", nameof(projectName));
+        }
+
+        using var http = CreateHttpClient();
+
+        var project = await GetProjectOrCreateAsync(projectName);
+        if (string.IsNullOrWhiteSpace(project.Id))
+        {
+            throw new InvalidOperationException($"Project '{projectName}' does not have a projectId.");
+        }
+
+        using var projectResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
+        projectResponse.EnsureSuccessStatusCode();
+
+        var refreshedProject = await ReadProjectFromResponseAsync(projectResponse)
+            ?? throw new InvalidOperationException($"Could not parse project.one response for project '{projectName}'.");
+
+        var targetEnvironment = refreshedProject.Environments
+            .FirstOrDefault(e => string.Equals(e.Name, "production", StringComparison.OrdinalIgnoreCase))
+            ?? refreshedProject.Environments.FirstOrDefault();
+
+        if (targetEnvironment is null || string.IsNullOrWhiteSpace(targetEnvironment.Id))
+        {
+            throw new InvalidOperationException($"Project '{refreshedProject.Name}' has no usable environment for application deployment.");
+        }
+
+        var existing = targetEnvironment.Applications.FirstOrDefault(a =>
+            string.Equals(a.Name, appName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.AppName, appName, StringComparison.OrdinalIgnoreCase));
+
+        if (existing is not null)
+        {
+            logger.LogInformation("Application {AppName} already exists in project {ProjectName}.", rsc.Name, refreshedProject.Name);
+            return await EnsureDockerProviderConfiguredAsync(http, existing, rsc);
+        }
+
+        var createBody = JsonSerializer.Serialize(new
+        {
+            name = appName,
+            appName,
+            description = "Created by Aspire deploy pipeline.",
+            environmentId = targetEnvironment.Id
+        }, JsonOptions);
+
+        using var createResponse = await http.PostAsync("api/application.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
+        createResponse.EnsureSuccessStatusCode();
+
+        var created = await ReadApplicationFromResponseAsync(createResponse);
+        if (created is not null)
+        {
+            logger.LogInformation("Created application {AppName} in project {ProjectName}.", rsc.Name, refreshedProject.Name);
+            return await EnsureDockerProviderConfiguredAsync(http, created, rsc);
+        }
+
+        // Fallback for APIs that return ack-only payloads.
+        using var verifyResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
+        verifyResponse.EnsureSuccessStatusCode();
+
+        var verifiedProject = await ReadProjectFromResponseAsync(verifyResponse)
+            ?? throw new InvalidOperationException($"Application create succeeded but project '{projectName}' could not be reloaded.");
+
+        var verifiedEnvironment = verifiedProject.Environments
+            .FirstOrDefault(e => string.Equals(e.Name, targetEnvironment.Name, StringComparison.OrdinalIgnoreCase));
+
+        var verified = verifiedEnvironment?.Applications.FirstOrDefault(a =>
+            string.Equals(a.Name, appName, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(a.AppName, appName, StringComparison.OrdinalIgnoreCase));
+
+        if (verified is null)
+        {
+            throw new InvalidOperationException($"Application '{appName}' was not found after create in project '{projectName}'.");
+        }
+
+        return await EnsureDockerProviderConfiguredAsync(http, verified, rsc);
+    }
+
+    private async Task<Application> EnsureDockerProviderConfiguredAsync(HttpClient http, Application application, IComputeResource rsc)
+    {
+        if (string.IsNullOrWhiteSpace(application.Id))
+        {
+            throw new InvalidOperationException($"Application '{rsc.Name}' has no applicationId, so provider cannot be configured.");
+        }
+
+        var registryUrl = GetRegistryUrl();
+
+        string? dockerImage = null;
+
+        if (rsc.TryGetLastAnnotation<DockerfileBuildAnnotation>(out var buildAnnotation) || rsc is ProjectResource pr)
+        {
+            var imageref = new ContainerImageReference(rsc);
+            dockerImage = await ((IValueProvider)imageref).GetValueAsync();
+        }
+        else if (rsc.TryGetContainerImageName(out var imageName))
+        {
+            dockerImage = imageName;
+        }
+        else
+        {
+            throw new InvalidOperationException($"Compute resource '{rsc.Name}' does not have Docker image information in annotations or properties.");
+        }
+        
+
+
+        var saveBody = JsonSerializer.Serialize(new
+        {
+            applicationId = application.Id,
+            registryUrl,
+            dockerImage,
+            username = RegistryUsername,
+            password = RegistryPassword
+        }, JsonOptions);
+
+        using var saveResponse = await http.PostAsync("api/application.saveDockerProvider", new StringContent(saveBody, Encoding.UTF8, "application/json"));
+        saveResponse.EnsureSuccessStatusCode();
+
+        logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
+
+        await EnsureApplicationDomainAsync(http, application);
+
+        var deployBody = JsonSerializer.Serialize(new
+        {
+            applicationId = application.Id,
+            title = $"Aspire deployment for {rsc.Name}",
+            description = $"Automated deploy for resource '{rsc.Name}' in project '{env.ApplicationName}'."
+        }, JsonOptions);
+
+        using var deployResponse = await http.PostAsync("api/application.deploy", new StringContent(deployBody, Encoding.UTF8, "application/json"));
+        deployResponse.EnsureSuccessStatusCode();
+
+        logger.LogInformation("Triggered application deploy for {AppName}.", rsc.Name);
+
+        return application;
+    }
+
+    private async Task EnsureApplicationDomainAsync(HttpClient http, Application application)
+    {
+        if (string.IsNullOrWhiteSpace(application.Id))
+        {
+            throw new InvalidOperationException("Application id is required to verify domains.");
+        }
+
+        using var byAppResponse = await http.GetAsync($"api/domain.byApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
+        byAppResponse.EnsureSuccessStatusCode();
+
+        var existingDomains = await ReadDomainsFromResponseAsync(byAppResponse, logger);
+        if (existingDomains.Count > 0)
+        {
+            logger.LogInformation("Application {AppName} already has {Count} domain(s).", application.AppName, existingDomains.Count);
+            return;
+        }
+
+        var appNameForDomain = string.IsNullOrWhiteSpace(application.AppName) ? application.Name : application.AppName;
+        if (string.IsNullOrWhiteSpace(appNameForDomain))
+        {
+            throw new InvalidOperationException("Application name is required to generate a domain.");
+        }
+
+        var generateBody = JsonSerializer.Serialize(new
+        {
+            appName = appNameForDomain
+        }, JsonOptions);
+
+        using var generateResponse = await http.PostAsync("api/domain.generateDomain", new StringContent(generateBody, Encoding.UTF8, "application/json"));
+        generateResponse.EnsureSuccessStatusCode();
+
+        var generatedHost = await ReadGeneratedHostFromResponseAsync(generateResponse, logger)
+            ?? throw new InvalidOperationException($"Could not parse generated domain host for application '{appNameForDomain}'.");
+
+        var createBody = JsonSerializer.Serialize(new
+        {
+            applicationId = application.Id,
+            host = generatedHost,
+            port = 8080,
+            http = false,
+            domainType = "application"
+        }, JsonOptions);
+
+        using var createResponse = await http.PostAsync("api/domain.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
+        createResponse.EnsureSuccessStatusCode();
+
+        logger.LogInformation("Created domain {DomainHost} for application {AppName}.", generatedHost, appNameForDomain);
+    }
+
+    private static async Task<List<Domain>> ReadDomainsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null)
+    {
+        var content = NormalizeJsonPayload(await response.Content.ReadAsStringAsync());
+        logger?.LogInformation("domain.byApplicationId payload: {Payload}", GetPayloadSnippet(content));
+
+        using var root = JsonDocument.Parse(content);
+        logger?.LogInformation("domain.byApplicationId root kind: {RootKind}", root.RootElement.ValueKind);
+        if (root.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            var direct = JsonSerializer.Deserialize<Domain>(content, JsonOptions);
+            if (direct is not null && !string.IsNullOrWhiteSpace(direct.Host))
+            {
+                return new List<Domain> { direct };
+            }
+
+            var wrapped = JsonSerializer.Deserialize<TrpcEnvelope<List<Domain>>>(content, JsonOptions);
+            var wrappedDomains = wrapped?.Result?.Data?.Json?.Where(d => !string.IsNullOrWhiteSpace(d.Host)).ToList();
+            if (wrappedDomains is { Count: > 0 })
+            {
+                return wrappedDomains;
+            }
+
+            var wrappedSingle = JsonSerializer.Deserialize<TrpcEnvelope<Domain>>(content, JsonOptions);
+            var single = wrappedSingle?.Result?.Data?.Json;
+            if (single is not null && !string.IsNullOrWhiteSpace(single.Host))
+            {
+                return new List<Domain> { single };
+            }
+
+            return [];
+        }
+
+        var directList = JsonSerializer.Deserialize<List<Domain>>(content, JsonOptions);
+        if (directList is { Count: > 0 })
+        {
+            return directList.Where(d => !string.IsNullOrWhiteSpace(d.Host)).ToList();
+        }
+
+        var wrappedList = JsonSerializer.Deserialize<List<TrpcEnvelope<List<Domain>>>>(content, JsonOptions);
+        if (wrappedList is { Count: > 0 })
+        {
+            var domains = wrappedList
+                .SelectMany(x => x.Result?.Data?.Json ?? new List<Domain>())
+                .Where(d => !string.IsNullOrWhiteSpace(d.Host))
+                .ToList();
+
+            if (domains.Count > 0)
+            {
+                return domains;
+            }
+        }
+
+        var wrappedSingleList = JsonSerializer.Deserialize<List<TrpcEnvelope<Domain>>>(content, JsonOptions);
+        if (wrappedSingleList is { Count: > 0 })
+        {
+            var domains = wrappedSingleList
+                .Select(x => x.Result?.Data?.Json)
+                .Where(d => d is not null && !string.IsNullOrWhiteSpace(d.Host))
+                .Select(d => d!)
+                .ToList();
+
+            if (domains.Count > 0)
+            {
+                return domains;
+            }
+        }
+
+        return new List<Domain>();
+    }
+
+    private static async Task<string?> ReadGeneratedHostFromResponseAsync(HttpResponseMessage response, ILogger? logger = null)
+    {
+        var content = NormalizeJsonPayload(await response.Content.ReadAsStringAsync());
+        logger?.LogInformation("domain.generateDomain payload: {Payload}", GetPayloadSnippet(content));
+
+        using var root = JsonDocument.Parse(content);
+        logger?.LogInformation("domain.generateDomain root kind: {RootKind}", root.RootElement.ValueKind);
+        if (root.RootElement.ValueKind == JsonValueKind.String)
+        {
+            return root.RootElement.GetString();
+        }
+
+        if (root.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            var wrappedString = JsonSerializer.Deserialize<TrpcEnvelope<string>>(content, JsonOptions);
+            var fromWrappedString = wrappedString?.Result?.Data?.Json;
+            if (!string.IsNullOrWhiteSpace(fromWrappedString))
+            {
+                return fromWrappedString;
+            }
+
+            var wrappedData = JsonSerializer.Deserialize<TrpcEnvelope<GeneratedDomainData>>(content, JsonOptions);
+            var fromWrappedData = wrappedData?.Result?.Data?.Json;
+            if (fromWrappedData is not null)
+            {
+                var host = fromWrappedData.Json ?? fromWrappedData.Host ?? fromWrappedData.Domain;
+                if (!string.IsNullOrWhiteSpace(host))
+                {
+                    return host;
+                }
+            }
+
+            var directString = JsonSerializer.Deserialize<string>(content, JsonOptions);
+            if (!string.IsNullOrWhiteSpace(directString))
+            {
+                return directString;
+            }
+
+            var directData = JsonSerializer.Deserialize<GeneratedDomainData>(content, JsonOptions);
+            if (directData is not null)
+            {
+                return directData.Json ?? directData.Host ?? directData.Domain;
+            }
+
+            return null;
+        }
+
+        var wrappedStringList = JsonSerializer.Deserialize<List<TrpcEnvelope<string>>>(content, JsonOptions);
+        var fromWrappedStringList = wrappedStringList?.Select(x => x.Result?.Data?.Json).FirstOrDefault(s => !string.IsNullOrWhiteSpace(s));
+        if (!string.IsNullOrWhiteSpace(fromWrappedStringList))
+        {
+            return fromWrappedStringList;
+        }
+
+        var wrappedDomainDataList = JsonSerializer.Deserialize<List<TrpcEnvelope<GeneratedDomainData>>>(content, JsonOptions);
+        var fromWrappedDataList = wrappedDomainDataList
+            ?.Select(x => x.Result?.Data?.Json)
+            .FirstOrDefault(x => x is not null && (!string.IsNullOrWhiteSpace(x.Json) || !string.IsNullOrWhiteSpace(x.Host) || !string.IsNullOrWhiteSpace(x.Domain)));
+        if (fromWrappedDataList is not null)
+        {
+            return fromWrappedDataList.Json ?? fromWrappedDataList.Host ?? fromWrappedDataList.Domain;
+        }
+
+        var directDomainData = JsonSerializer.Deserialize<GeneratedDomainData>(content, JsonOptions);
+        if (directDomainData is not null)
+        {
+            return directDomainData.Json ?? directDomainData.Host ?? directDomainData.Domain;
+        }
+
+        return null;
+    }
+
+    private static string NormalizeJsonPayload(string payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            return payload;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            if (doc.RootElement.ValueKind == JsonValueKind.String)
+            {
+                var inner = doc.RootElement.GetString();
+                if (!string.IsNullOrWhiteSpace(inner))
+                {
+                    var trimmed = inner.Trim();
+                    if (trimmed.StartsWith("{", StringComparison.Ordinal) || trimmed.StartsWith("[", StringComparison.Ordinal))
+                    {
+                        return trimmed;
+                    }
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // Leave payload unchanged; callers will surface proper parse errors if needed.
+        }
+
+        return payload;
+    }
+
+    private static string GetPayloadSnippet(string payload)
+    {
+        if (string.IsNullOrEmpty(payload))
+        {
+            return payload;
+        }
+
+        return payload.Length <= 500 ? payload : payload[..500];
+    }
+
+    private static async Task<Application?> ReadApplicationFromResponseAsync(HttpResponseMessage response)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var json = await JsonDocument.ParseAsync(stream);
+        return TryExtractApplication(json.RootElement);
+    }
+
+    private static Application? TryExtractApplication(JsonElement root)
+    {
+        if (TryDeserializeApplication(root, out var directApp))
+        {
+            return directApp;
+        }
+
+        if (root.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var key in new[] { "application", "data", "result" })
+            {
+                if (root.TryGetProperty(key, out var nested) && TryDeserializeApplication(nested, out var nestedApp))
+                {
+                    return nestedApp;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryDeserializeApplication(JsonElement value, out Application? application)
+    {
+        application = null;
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!value.TryGetProperty("name", out _) && !value.TryGetProperty("appName", out _))
+        {
+            return false;
+        }
+
+        application = value.Deserialize<Application>(JsonOptions);
+        return application is not null;
+    }
+
+    public class Project
+    {
+        [JsonPropertyName("projectId")]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = string.Empty;
+
+        [JsonPropertyName("description")]
+        public string? Description { get; init; }
+
+        [JsonPropertyName("env")]
+        public string? Env { get; init; }
+
+        [JsonPropertyName("environments")]
+        public List<Environment> Environments { get; init; } = new List<Environment>();
+
+    }
+    public class Compose
+    {
+        [JsonPropertyName("composeId")]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = string.Empty;
+
+        [JsonPropertyName("domains")]
+        public List<Domain> Domains { get; init; } = new List<Domain>();
+
+        [JsonPropertyName("env")]
+        public string Env { get; set; } = string.Empty;
+
+        [JsonPropertyName("composeFile")]
+        public string ComposeFile { get; set; } = string.Empty;
+
+    }
+
+    public class Environment
+    {
+        [JsonPropertyName("environmentId")]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = string.Empty;
+
+        
+        [JsonPropertyName("compose")]
+        public List<Compose> Compose {get; init;} = new List<Compose>();
+
+        [JsonPropertyName("applications")]
+        public List<Application> Applications { get; init; } = new List<Application>();
+
+    }
+
+    public class Registry
+    {
+        [JsonPropertyName("registryId")]
+        public string? RegistryId { get; init; }
+
+        [JsonPropertyName("registryUrl")]
+        public string RegistryUrl { get; init; } = string.Empty;
+
+        [JsonPropertyName("projectId")]
+        public string? ProjectId { get; init; }
+
+        [JsonPropertyName("environmentId")]
+        public string? EnvironmentId { get; init; }
+
+        [JsonPropertyName("composeId")]
+        public string? ComposeId { get; init; }
+
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = "registry";
+    }
+
+    private sealed class RemoteRegistry
+    {
+        [JsonPropertyName("registryId")]
+        public string? RegistryId { get; init; }
+
+        [JsonPropertyName("registryName")]
+        public string RegistryName { get; init; } = string.Empty;
+
+        [JsonPropertyName("imagePrefix")]
+        public string? ImagePrefix { get; init; }
+
+        [JsonPropertyName("username")]
+        public string Username { get; init; } = string.Empty;
+
+        [JsonPropertyName("password")]
+        public string Password { get; init; } = string.Empty;
+
+        [JsonPropertyName("registryUrl")]
+        public string RegistryUrl { get; init; } = string.Empty;
+
+        [JsonPropertyName("registryType")]
+        public string RegistryType { get; init; } = string.Empty;
+    }
+
+    public class Domain
+    {
+        [JsonPropertyName("domainId")]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("host")]
+        public string Host { get; init; } = string.Empty;
+    }
+
+    private sealed class TrpcEnvelope<T>
+    {
+        [JsonPropertyName("result")]
+        public TrpcResult<T>? Result { get; init; }
+    }
+
+    private sealed class TrpcResult<T>
+    {
+        [JsonPropertyName("data")]
+        public TrpcData<T>? Data { get; init; }
+    }
+
+    private sealed class TrpcData<T>
+    {
+        [JsonPropertyName("json")]
+        public T? Json { get; init; }
+    }
+
+    private sealed class GeneratedDomainData
+    {
+        [JsonPropertyName("json")]
+        public string? Json { get; init; }
+
+        [JsonPropertyName("host")]
+        public string? Host { get; init; }
+
+        [JsonPropertyName("domain")]
+        public string? Domain { get; init; }
+    }
+
+    public class Application
+    {
+        [JsonPropertyName("applicationId")]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = string.Empty;
+
+        [JsonPropertyName("appName")]
+        public string AppName { get; init; } = string.Empty;
+
+        [JsonPropertyName("dockerImage")]
+        public string? DockerImage { get; init; } = string.Empty;
+
+        [JsonPropertyName("registryUrl")]
+        public string? RegistryUrl { get; init; } = string.Empty;
+
+        [JsonPropertyName("username")]
+        public string? Username { get; init; } = string.Empty;
+
+        [JsonPropertyName("password")]
+        public string? Password { get; init; } = string.Empty;
+    }
+
+}
