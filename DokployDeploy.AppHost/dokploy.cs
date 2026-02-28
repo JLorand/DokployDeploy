@@ -14,14 +14,52 @@ using System.Text.RegularExpressions;
 public static class DokployExtensions
 {
     private const string DokployRegistryProjectName = "DokployRegistry";
+    private const string DefaultSelfHostedRegistryDomain = "aspirecli.dev";
+    private const string DefaultRegistryUsername = "docker";
+    private const string DefaultRegistryPassword = "password";
 
 
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProject(this IDistributedApplicationBuilder builder, string name)
     {
+        return builder.AddDokployProjectSelfHostedRegistry(name, DefaultSelfHostedRegistryDomain);
+    }
+
+    public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectSelfHostedRegistry(this IDistributedApplicationBuilder builder, string name, string registryDomainUrl)
+    {
+        if (string.IsNullOrWhiteSpace(registryDomainUrl))
+        {
+            throw new ArgumentException("A registry domain URL is required for a self-hosted Dokploy registry.", nameof(registryDomainUrl));
+        }
+
+        return AddDokployProjectCore(builder, name, DokployRegistrySettings.CreateSelfHosted(registryDomainUrl, DefaultRegistryUsername, DefaultRegistryPassword));
+    }
+
+    public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectHostedRegistry(this IDistributedApplicationBuilder builder, string name, string registryUrl, string username, string password)
+    {
+        if (string.IsNullOrWhiteSpace(registryUrl))
+        {
+            throw new ArgumentException("A registry URL is required for a hosted registry.", nameof(registryUrl));
+        }
+
+        if (string.IsNullOrWhiteSpace(username))
+        {
+            throw new ArgumentException("A registry username is required for a hosted registry.", nameof(username));
+        }
+
+        if (string.IsNullOrWhiteSpace(password))
+        {
+            throw new ArgumentException("A registry password is required for a hosted registry.", nameof(password));
+        }
+
+        return AddDokployProjectCore(builder, name, DokployRegistrySettings.CreateHosted(registryUrl, username, password));
+    }
+
+    private static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectCore(this IDistributedApplicationBuilder builder, string name, DokployRegistrySettings registrySettings)
+    {
 
         if (builder.ExecutionContext.IsRunMode)
         {
-            return builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name, null!));
+            return builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name, null!, registrySettings));
         }
 #pragma warning disable ASPIREINTERACTION001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
         var apikey = builder.AddParameter($"{name}-apiKey", secret: true)
@@ -34,7 +72,7 @@ public static class DokployExtensions
             });
 #pragma warning restore ASPIREINTERACTION001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
 
-        var x = builder.AddResource(new DokployProjectEnvironmentResource(name, apikey.Resource));
+        var x = builder.AddResource(new DokployProjectEnvironmentResource(name, apikey.Resource, registrySettings));
 
         builder.Eventing.Subscribe<BeforeStartEvent>(async (e, ct) =>
         {
@@ -53,23 +91,57 @@ public static class DokployExtensions
     }
 }
 
+internal enum DokployRegistryMode
+{
+    SelfHosted,
+    Hosted
+}
+
+internal sealed class DokployRegistrySettings
+{
+    private DokployRegistrySettings(DokployRegistryMode mode, string registryUrl, string username, string password, string registryType)
+    {
+        Mode = mode;
+        RegistryUrl = registryUrl;
+        Username = username;
+        Password = password;
+        RegistryType = registryType;
+    }
+
+    public DokployRegistryMode Mode { get; }
+    public string RegistryUrl { get; }
+    public string Username { get; }
+    public string Password { get; }
+    public string RegistryType { get; }
+
+    public static DokployRegistrySettings CreateSelfHosted(string registryUrl, string username, string password) => new(DokployRegistryMode.SelfHosted, registryUrl, username, password, "cloud");
+    public static DokployRegistrySettings CreateHosted(string registryUrl, string username, string password) => new(DokployRegistryMode.Hosted, registryUrl, username, password, "cloud");
+}
+
 public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 {
     private readonly string _name;
-    public DokployProjectEnvironmentResource(string name, ParameterResource apikey) : base(name)
+    private readonly DokployRegistrySettings _registrySettings;
+    internal DokployProjectEnvironmentResource(string name, ParameterResource apikey, DokployRegistrySettings registrySettings) : base(name)
     {
         _name = name;
+        _registrySettings = registrySettings;
 
 #pragma warning disable ASPIREPIPELINES001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
         Annotations.Add(new PipelineStepAnnotation(ctx =>
         {
-           return [new PipelineStep() {
+            return [new PipelineStep() {
                Name = $"prepare-registry-{name}",
                Action = async ctx => {
-                var apiKeyVal = await apikey.GetValueAsync(ctx.CancellationToken) ?? throw new Exception($"API key for project {name} is not set."); 
-                ctx.Logger.LogInformation("Deploying project {ProjectName} with API key {ApiKey}", name, apiKeyVal?.Substring(0, 4) + "****" + apiKeyVal?.Substring(apiKeyVal.Length - 4));
+                var apiKeyVal = await apikey.GetValueAsync(ctx.CancellationToken);
+                if (string.IsNullOrWhiteSpace(apiKeyVal))
+                {
+                    throw new Exception($"API key for project {name} is not set.");
+                }
+
+                ctx.Logger.LogInformation("Deploying project {ProjectName} with API key {ApiKey}", name, apiKeyVal.Substring(0, 4) + "****" + apiKeyVal.Substring(apiKeyVal.Length - 4));
                 // TODO: Add the api url as a parameter later
-                var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger);
+                var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, _registrySettings);
 
                 // We create a project for the given apphost
                 var projectName = $"{name}-project";
@@ -85,7 +157,7 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 #pragma warning disable ASPIRECONTAINERRUNTIME001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
                 var containerRuntime = ctx.Services.GetRequiredService<IContainerRuntime>();
 #pragma warning restore ASPIRECONTAINERRUNTIME001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
-                await containerRuntime.LoginToRegistryAsync(registry.RegistryUrl, "docker", "password", ctx.CancellationToken);
+                await containerRuntime.LoginToRegistryAsync(registry.RegistryUrl, _registrySettings.Username, _registrySettings.Password, ctx.CancellationToken);
                 
 
 
@@ -97,7 +169,13 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
            }, new PipelineStep() {
                Name = $"provision-apps-{name}",
                Action = async ctx => {
-                    var api = new DokployApi(await apikey.GetValueAsync(ctx.CancellationToken) ?? throw new Exception($"API key for project {name} is not set."), "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger);
+                    var apiKeyVal = await apikey.GetValueAsync(ctx.CancellationToken);
+                    if (string.IsNullOrWhiteSpace(apiKeyVal))
+                    {
+                        throw new Exception($"API key for project {name} is not set.");
+                    }
+
+                    var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, _registrySettings);
                     var rscs = ctx.Model.GetComputeResources();
 
                     List<DokployApi.Application> applications = new();
@@ -126,12 +204,8 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
     ReferenceExpression IContainerRegistry.Name => ReferenceExpression.Create($"{_name}-registry");
 }
 
-public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger logger)
+internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger logger, DokployRegistrySettings registrySettings)
 {
-    private const string RegistryDomain = "aspirecli.dev";
-    private const string RegistryUsername = "docker";
-    private const string RegistryPassword = "password";
-
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -305,6 +379,20 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
             throw new InvalidOperationException($"Project '{refreshedProject.Name}' has no usable environment (expected one named 'production').");
         }
 
+        if (registrySettings.Mode == DokployRegistryMode.Hosted)
+        {
+            var hostedRegistryName = $"{refreshedProject.Name}-registry";
+            var linkedHostedRegistry = await EnsureRegistryLinkedAsync(http, hostedRegistryName);
+            return new Registry
+            {
+                RegistryId = linkedHostedRegistry?.RegistryId,
+                RegistryUrl = linkedHostedRegistry?.RegistryUrl ?? GetRegistryUrl(),
+                ProjectId = refreshedProject.Id,
+                EnvironmentId = targetEnvironment.Id,
+                Name = linkedHostedRegistry?.RegistryName ?? hostedRegistryName
+            };
+        }
+
         var existingRegistry = targetEnvironment.Compose
             .FirstOrDefault(c => string.Equals(c.Name, "registry", StringComparison.OrdinalIgnoreCase));
 
@@ -312,7 +400,7 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
         {
             var existingRegistryDetails = await GetComposeDetailsAsync(http, existingRegistry);
             await DeployComposeAsync(http, existingRegistryDetails);
-            var linkedRegistry = await EnsureRegistryLinkedAsync(http, refreshedProject, targetEnvironment, existingRegistryDetails);
+            var linkedRegistry = await EnsureRegistryLinkedAsync(http, existingRegistryDetails.Name);
 
             logger.LogInformation("Registry compose already exists for project {ProjectName} in environment {EnvironmentName}.", refreshedProject.Name, targetEnvironment.Name);
             return new Registry
@@ -361,7 +449,7 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
 
         var verifiedRegistryDetails = await GetComposeDetailsAsync(http, verifiedRegistry);
         await DeployComposeAsync(http, verifiedRegistryDetails);
-        var linkedVerifiedRegistry = await EnsureRegistryLinkedAsync(http, verifiedProject, verifiedEnvironment, verifiedRegistryDetails);
+        var linkedVerifiedRegistry = await EnsureRegistryLinkedAsync(http, verifiedRegistryDetails.Name);
 
         return new Registry
         {
@@ -454,19 +542,19 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
         return compose is not null;
     }
 
-    private async Task<RemoteRegistry?> EnsureRegistryLinkedAsync(HttpClient http, Project project, Environment? environment, Compose compose)
+    private async Task<RemoteRegistry?> EnsureRegistryLinkedAsync(HttpClient http, string registryName)
     {
         var registryUrl = GetRegistryUrl();
-        var username = RegistryUsername;
-        var password = RegistryPassword;
+        var username = registrySettings.Username;
+        var password = registrySettings.Password;
 
         var testInput = new RegistryRequestPayload
         {
-            RegistryName = compose.Name,
+            RegistryName = registryName,
             Username = username,
             Password = password,
             RegistryUrl = registryUrl,
-            RegistryType = "cloud"
+            RegistryType = registrySettings.RegistryType
         };
 
         var existingRegistry = await FindExistingRegistryAsync(http, testInput);
@@ -487,11 +575,11 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
 
         var createBody = JsonSerializer.Serialize(new
         {
-            registryName = compose.Name,
+            registryName = registryName,
             username,
             password,
             registryUrl,
-            registryType = "cloud",
+            registryType = registrySettings.RegistryType,
             imagePrefix = registryUrl
         }, JsonOptions);
 
@@ -520,8 +608,7 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
         var registries = await ReadRegistriesFromResponseAsync(allResponse);
         return registries.FirstOrDefault(r =>
             string.Equals(r.RegistryUrl, payload.RegistryUrl, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(r.Username, payload.Username, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(r.RegistryName, payload.RegistryName, StringComparison.OrdinalIgnoreCase));
+            string.Equals(r.Username, payload.Username, StringComparison.OrdinalIgnoreCase));
     }
 
     private static async Task<List<RemoteRegistry>> ReadRegistriesFromResponseAsync(HttpResponseMessage response)
@@ -700,9 +787,9 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
         public string RegistryType { get; init; } = string.Empty;
     }
 
-    private static string GetRegistryUrl()
+    private string GetRegistryUrl()
     {
-        return RegistryDomain;
+        return registrySettings.RegistryUrl;
     }
 
     private static string GetRegistryUsernameFromCompose(Compose compose)
@@ -900,8 +987,8 @@ public class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger
             applicationId = application.Id,
             registryUrl,
             dockerImage,
-            username = RegistryUsername,
-            password = RegistryPassword
+            username = registrySettings.Username,
+            password = registrySettings.Password
         }, JsonOptions);
 
         using var saveResponse = await http.PostAsync("api/application.saveDockerProvider", new StringContent(saveBody, Encoding.UTF8, "application/json"));

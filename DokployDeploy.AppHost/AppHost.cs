@@ -2,7 +2,7 @@ var builder = DistributedApplication.CreateBuilder(args);
 
 // var dockerenv = builder.AddDockerComposeEnvironment("dockerenv");
 
-builder.AddDokployProject("dokploydeploy");
+builder.AddDokployProjectSelfHostedRegistry("dokploydeploy", "aspirecli.dev");
 
 var cache = builder.AddRedis("cache");
 
