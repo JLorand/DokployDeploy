@@ -12,16 +12,21 @@ The integration is currently implemented directly in:
 
 - Creates or reuses a Dokploy project.
 - Supports two registry modes:
-  - **Self-hosted on Dokploy** (requires a registry domain URL).
-  - **Externally hosted registry** (requires registry URL, username, and password).
+  - **Self-hosted on Dokploy** (prompts for registry domain URL during deploy).
+  - **Externally hosted registry** (prompts for registry URL, username, and password during deploy).
+- For self-hosted registry mode, automatically ensures a compose domain for the registry using:
+  - `port: 5000`
+  - `https: true`
+  - `certificateType: letsencrypt`
+  - idempotent host check/update via `domain.byComposeId` + `domain.update`/`domain.create`.
 - Builds and pushes app images, configures Docker provider settings, and triggers app deploys.
 - Ensures each created application has a domain (currently using a fixed port value).
 
 ## Extension methods
 
 ```csharp
-builder.AddDokployProjectSelfHostedRegistry(name, registryDomainUrl);
-builder.AddDokployProjectHostedRegistry(name, registryUrl, username, password);
+builder.AddDokployProjectSelfHostedRegistry(name);
+builder.AddDokployProjectHostedRegistry(name);
 ```
 
 Backward compatibility is preserved:
@@ -30,24 +35,27 @@ Backward compatibility is preserved:
 builder.AddDokployProject(name);
 ```
 
-`AddDokployProject(name)` maps to the self-hosted mode with a default registry domain.
+`AddDokployProject(name)` maps to the self-hosted mode and prompts for the registry domain URL.
 
 ## Example usage
 
-Self-hosted registry mode:
+Self-hosted registry mode (parameter prompt):
 
 ```csharp
-builder.AddDokployProjectSelfHostedRegistry("dokploydeploy", "aspirecli.dev");
+builder.AddDokployProjectSelfHostedRegistry("dokploydeploy");
 ```
 
-Hosted registry mode:
+Hosted registry mode (parameter prompts):
 
 ```csharp
-builder.AddDokployProjectHostedRegistry(
-    "dokploydeploy",
-    "registry.example.com",
-    "registry-user",
-    "registry-password");
+builder.AddDokployProjectHostedRegistry("dokploydeploy");
+```
+
+Optional explicit-value overloads are still available if you want to hardcode values:
+
+```csharp
+builder.AddDokployProjectSelfHostedRegistry(name, registryDomainUrl);
+builder.AddDokployProjectHostedRegistry(name, registryUrl, username, password);
 ```
 
 ## Known limitations
