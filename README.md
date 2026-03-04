@@ -1,24 +1,66 @@
 # Dokploy Aspire Integration
 
-## Description
-This was built on the Aspirifridays stream with Maddy Montaquila, David Fowler, and Damian Edwards with support from Mauricio the maintainer of Dokploy.
+This repository contains an Aspire AppHost integration for deploying resources to Dokploy.
 
-## The integration itself
-The actual classes used are in the apphost project in the dokploy.cs file. They have not been pulled out into a neat and usable package or project by itself or anything.
+## Where the integration lives
 
-## What's there and what's missing
-It *will*:
-This current implementation is able to create a project on your dokploy server and add a registry to it. This registry will be added to the list of linked registries in dokploy.
-Then it takes your apphost resources, builds them, and then pushes them to the registry.
-After that it will, for each resource, go through and add applications in that same project which use a docker provider to pull from the registry in the same project.
-Then it will assign these applications a domain (the port is currently hardcoded to 8080) and afterwards start them up.
+The integration is currently implemented directly in:
 
-It *will not*:
-Make these applications connected. Their wiring through the environment variables are simply not set up yet.
-Create domains for each resources endpoints.
-Allow you to add parameters yourself configuring anything like this. The only parameterized thing is currently the dokploy api key the integration uses to call the dokploy api.
-**Important to know:** the registry will be created but it needs a custom domain that you own or have set up in order to wire it through. Its domain will also be hardcoded in the file too.
+- `DokployDeploy.AppHost\\dokploy.cs`
 
-## Disclaimer:
-Not only was this done during a livestream by me, a student, in the driving seat but it was also half using AI and half running purely as fast as I could as a 
-windows voice to text for the far more intelligent people than me on the livestream. This is far from what I would call nice or beautiful. But it's freely available for anyone to dive into right here.
+## Current capabilities
+
+- Creates or reuses a Dokploy project.
+- Supports two registry modes:
+  - **Self-hosted on Dokploy** (prompts for registry domain URL during deploy).
+  - **Externally hosted registry** (prompts for registry URL, username, and password during deploy).
+- For self-hosted registry mode, automatically ensures a compose domain for the registry using:
+  - `port: 5000`
+  - `https: true`
+  - `certificateType: letsencrypt`
+  - idempotent host check/update via `domain.byComposeId` + `domain.update`/`domain.create`.
+- Builds and pushes app images, configures Docker provider settings, and triggers app deploys.
+- Ensures each created application has a domain (currently using a fixed port value).
+
+## Extension methods
+
+```csharp
+builder.AddDokployProjectSelfHostedRegistry(name);
+builder.AddDokployProjectHostedRegistry(name);
+```
+
+Backward compatibility is preserved:
+
+```csharp
+builder.AddDokployProject(name);
+```
+
+`AddDokployProject(name)` maps to the self-hosted mode and prompts for the registry domain URL.
+
+## Example usage
+
+Self-hosted registry mode (parameter prompt):
+
+```csharp
+builder.AddDokployProjectSelfHostedRegistry("dokploydeploy");
+```
+
+Hosted registry mode (parameter prompts):
+
+```csharp
+builder.AddDokployProjectHostedRegistry("dokploydeploy");
+```
+
+Optional explicit-value overloads are still available if you want to hardcode values:
+
+```csharp
+builder.AddDokployProjectSelfHostedRegistry(name, registryDomainUrl);
+builder.AddDokployProjectHostedRegistry(name, registryUrl, username, password);
+```
+
+## Known limitations
+
+- Dokploy API base URL is still hardcoded in the current implementation.
+- Application domain creation currently uses a fixed port (`8080`).
+- Resource-to-resource environment wiring is still incomplete.
+- The integration is not yet packaged as a reusable standalone library.
