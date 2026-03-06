@@ -1,9 +1,11 @@
+using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Pipelines;
 using Aspire.Hosting.Publishing;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using System.Globalization;
 using System.Linq;
 using System.Net.Http.Headers;
 using System.Text;
@@ -267,13 +269,26 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                     var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, resolvedRegistrySettings);
                     var rscs = ctx.Model.GetComputeResources();
 
-                    List<DokployApi.Application> applications = new();
+                    var applications = new List<(IComputeResource Resource, DokployApi.Application Application)>();
 
                     foreach (var rsc in rscs)
                     {
                         // Get or create call
-                        var application = await api.GetOrCreateApplication($"{name}-app-{rsc.Name}", $"{name}-project", (IComputeResource)rsc);
-                        applications.Add(application);
+                        var computeResource = (IComputeResource)rsc;
+                        var application = await api.GetOrCreateApplication($"{name}-app-{rsc.Name}", $"{name}-project");
+                        applications.Add((computeResource, application));
+                    }
+
+                    // Phase 2: update docker provider, domains, and env after all applications exist.
+                    foreach (var app in applications)
+                    {
+                        await api.ConfigureApplicationAsync(app.Application, $"{name}-project", app.Resource, ctx.ExecutionContext, ctx.CancellationToken);
+                    }
+
+                    // Phase 3: start/deploy applications only after all configuration is applied.
+                    foreach (var app in applications)
+                    {
+                        await api.DeployApplicationAsync(app.Application, app.Resource);
                     }
 
 
@@ -1014,7 +1029,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         throw new InvalidOperationException($"Required env key '{key}' was not found in compose env values.");
     }
 
-    internal async Task<Application> GetOrCreateApplication(string appName, string projectName, IComputeResource rsc)
+    internal async Task<Application> GetOrCreateApplication(string appName, string projectName)
     {
         if (string.IsNullOrWhiteSpace(appName))
         {
@@ -1055,8 +1070,8 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
 
         if (existing is not null)
         {
-            logger.LogInformation("Application {AppName} already exists in project {ProjectName}.", rsc.Name, refreshedProject.Name);
-            return await EnsureDockerProviderConfiguredAsync(http, existing, rsc);
+            logger.LogInformation("Application {AppName} already exists in project {ProjectName}.", appName, refreshedProject.Name);
+            return existing;
         }
 
         var createBody = JsonSerializer.Serialize(new
@@ -1073,8 +1088,8 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         var created = await ReadApplicationFromResponseAsync(createResponse);
         if (created is not null)
         {
-            logger.LogInformation("Created application {AppName} in project {ProjectName}.", rsc.Name, refreshedProject.Name);
-            return await EnsureDockerProviderConfiguredAsync(http, created, rsc);
+            logger.LogInformation("Created application {AppName} in project {ProjectName}.", appName, refreshedProject.Name);
+            return created;
         }
 
         // Fallback for APIs that return ack-only payloads.
@@ -1096,11 +1111,18 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             throw new InvalidOperationException($"Application '{appName}' was not found after create in project '{projectName}'.");
         }
 
-        return await EnsureDockerProviderConfiguredAsync(http, verified, rsc);
+        return verified;
     }
 
-    private async Task<Application> EnsureDockerProviderConfiguredAsync(HttpClient http, Application application, IComputeResource rsc)
+    internal async Task ConfigureApplicationAsync(
+        Application application,
+        string projectName,
+        IComputeResource rsc,
+        DistributedApplicationExecutionContext executionContext,
+        CancellationToken cancellationToken)
     {
+        using var http = CreateHttpClient();
+
         if (string.IsNullOrWhiteSpace(application.Id))
         {
             throw new InvalidOperationException($"Application '{rsc.Name}' has no applicationId, so provider cannot be configured.");
@@ -1126,7 +1148,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         
 
 
-        var saveBody = JsonSerializer.Serialize(new
+        var saveDockerProviderBody = JsonSerializer.Serialize(new
         {
             applicationId = application.Id,
             registryUrl,
@@ -1135,12 +1157,24 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             password = registrySettings.Password
         }, JsonOptions);
 
-        using var saveResponse = await http.PostAsync("api/application.saveDockerProvider", new StringContent(saveBody, Encoding.UTF8, "application/json"));
-        saveResponse.EnsureSuccessStatusCode();
+        using var saveDockerProviderResponse = await http.PostAsync("api/application.saveDockerProvider", new StringContent(saveDockerProviderBody, Encoding.UTF8, "application/json"));
+        saveDockerProviderResponse.EnsureSuccessStatusCode();
 
         logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
 
-        await EnsureApplicationDomainAsync(http, application);
+        await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, cancellationToken);
+
+        await EnsureApplicationDomainAsync(http, application, rsc);
+    }
+
+    internal async Task DeployApplicationAsync(Application application, IComputeResource rsc)
+    {
+        using var http = CreateHttpClient();
+
+        if (string.IsNullOrWhiteSpace(application.Id))
+        {
+            throw new InvalidOperationException($"Application '{rsc.Name}' has no applicationId, so deployment cannot be triggered.");
+        }
 
         var deployBody = JsonSerializer.Serialize(new
         {
@@ -1153,15 +1187,253 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         deployResponse.EnsureSuccessStatusCode();
 
         logger.LogInformation("Triggered application deploy for {AppName}.", rsc.Name);
-
-        return application;
     }
 
-    private async Task EnsureApplicationDomainAsync(HttpClient http, Application application)
+    private async Task SaveApplicationEnvironmentAsync(
+        HttpClient http,
+        Application application,
+        string projectName,
+        IComputeResource resource,
+        DistributedApplicationExecutionContext executionContext,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(application.Id))
+        {
+            throw new InvalidOperationException("Application id is required to save environment variables.");
+        }
+
+        var environmentVariables = await ResolveResourceEnvironmentAsync(resource, projectName, executionContext, cancellationToken);
+        if (environmentVariables.Count == 0)
+        {
+            logger.LogInformation("No Aspire environment variables found for resource {ResourceName}.", resource.Name);
+            return;
+        }
+
+        var envPayload = string.Join(
+            '\n',
+            environmentVariables
+                .OrderBy(kv => kv.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(kv => $"{kv.Key}={EscapeEnvValue(kv.Value)}"));
+
+        var envKeys = environmentVariables.Keys
+            .OrderBy(k => k, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        logger.LogInformation(
+            "Preparing to save {Count} environment variable(s) for resource {ResourceName}. Keys: {EnvironmentKeys}",
+            envKeys.Length,
+            resource.Name,
+            string.Join(", ", envKeys));
+        logger.LogInformation(
+            "Environment payload size for resource {ResourceName}: {PayloadLength} characters.",
+            resource.Name,
+            envPayload.Length);
+
+        var saveEnvironmentBody = JsonSerializer.Serialize(new
+        {
+            applicationId = application.Id,
+            env = envPayload,
+            createEnvFile = true,
+            buildArgs = "",
+            buildSecrets = ""
+        }, JsonOptions);
+
+        using var saveEnvironmentResponse = await http.PostAsync(
+            "api/application.saveEnvironment",
+            new StringContent(saveEnvironmentBody, Encoding.UTF8, "application/json"));
+
+        saveEnvironmentResponse.EnsureSuccessStatusCode();
+
+        logger.LogInformation(
+            "Saved {Count} environment variable(s) for application {AppName}.",
+            environmentVariables.Count,
+            resource.Name);
+    }
+
+    private async Task<Dictionary<string, string>> ResolveResourceEnvironmentAsync(
+        IComputeResource resource,
+        string projectName,
+        DistributedApplicationExecutionContext executionContext,
+        CancellationToken cancellationToken)
+    {
+        var environmentVariables = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
+        if (resource.TryGetAnnotationsOfType<EnvironmentCallbackAnnotation>(out var environmentCallbacks))
+        {
+            var callbackContext = new EnvironmentCallbackContext(
+                executionContext,
+                resource,
+                environmentVariables,
+                cancellationToken: cancellationToken);
+
+            foreach (var callback in environmentCallbacks)
+            {
+                await callback.Callback(callbackContext).ConfigureAwait(false);
+            }
+        }
+
+        var materialized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var kv in environmentVariables)
+        {
+            if (string.IsNullOrWhiteSpace(kv.Key))
+            {
+                continue;
+            }
+
+            var value = await MaterializeEnvironmentValueAsync(kv.Value, projectName, cancellationToken).ConfigureAwait(false);
+            materialized[kv.Key] = value;
+        }
+
+        return materialized;
+    }
+
+    private async Task<string> MaterializeEnvironmentValueAsync(object? value, string projectName, CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            switch (value)
+            {
+                case null:
+                    return string.Empty;
+                case string s:
+                    return s;
+                case bool b:
+                    return b ? "true" : "false";
+                case byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal:
+                    return Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+                case EndpointReference endpointReference:
+                    return ResolveEndpointValue(endpointReference, EndpointProperty.Url, projectName);
+                case EndpointReferenceExpression endpointReferenceExpression:
+                    return ResolveEndpointValue(endpointReferenceExpression.Endpoint, endpointReferenceExpression.Property, projectName);
+                case ParameterResource parameter:
+                    return await parameter.GetValueAsync(cancellationToken).ConfigureAwait(false) ?? string.Empty;
+                case ConnectionStringReference connectionStringReference:
+                    value = connectionStringReference.Resource.ConnectionStringExpression;
+                    continue;
+                case IResourceWithConnectionString resourceWithConnectionString:
+                    value = resourceWithConnectionString.ConnectionStringExpression;
+                    continue;
+                case ReferenceExpression referenceExpression:
+                    return await FormatReferenceExpressionAsync(referenceExpression, projectName, cancellationToken).ConfigureAwait(false);
+                case IValueProvider valueProvider:
+                    return await valueProvider.GetValueAsync(cancellationToken).ConfigureAwait(false) ?? string.Empty;
+                case IManifestExpressionProvider manifestExpressionProvider:
+                    return manifestExpressionProvider.ValueExpression;
+                default:
+                    return Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+            }
+        }
+    }
+
+    private async Task<string> FormatReferenceExpressionAsync(ReferenceExpression expression, string projectName, CancellationToken cancellationToken)
+    {
+        if (expression is { Format: "{0}", ValueProviders.Count: 1 })
+        {
+            return await MaterializeEnvironmentValueAsync(expression.ValueProviders[0], projectName, cancellationToken).ConfigureAwait(false);
+        }
+
+        var args = new object[expression.ValueProviders.Count];
+        for (var i = 0; i < expression.ValueProviders.Count; i++)
+        {
+            args[i] = await MaterializeEnvironmentValueAsync(expression.ValueProviders[i], projectName, cancellationToken).ConfigureAwait(false);
+        }
+
+        return string.Format(CultureInfo.InvariantCulture, expression.Format, args);
+    }
+
+    private static string ResolveEndpointValue(EndpointReference endpointReference, EndpointProperty property, string projectName)
+    {
+        var referencedResource = endpointReference.Resource;
+        var host = GetApplicationServiceName(projectName, referencedResource?.Name ?? "unknown-service").ToLowerInvariant();
+
+        if (referencedResource is null)
+        {
+            return property switch
+            {
+                EndpointProperty.Host => host,
+                EndpointProperty.IPV4Host => host,
+                EndpointProperty.Port => "8080",
+                EndpointProperty.TargetPort => "8080",
+                EndpointProperty.HostAndPort => $"{host}:8080",
+                EndpointProperty.Scheme => "http",
+                _ => $"http://{host}:8080"
+            };
+        }
+
+        var resolved = referencedResource
+            .ResolveEndpoints()
+            .FirstOrDefault(e => string.Equals(e.Endpoint?.Name, endpointReference.EndpointName, StringComparison.OrdinalIgnoreCase));
+
+        var scheme = "http";
+        var port = 8080;
+
+        if (resolved?.Endpoint is { } endpoint)
+        {
+            scheme = endpoint.UriScheme ?? "http";
+            port = resolved.TargetPort.Value ?? resolved.ExposedPort.Value ?? 8080;
+        }
+
+        return property switch
+        {
+            EndpointProperty.Url => $"{scheme}://{host}:{port}",
+            EndpointProperty.Host => host,
+            EndpointProperty.IPV4Host => host,
+            EndpointProperty.Port => port.ToString(CultureInfo.InvariantCulture),
+            EndpointProperty.TargetPort => port.ToString(CultureInfo.InvariantCulture),
+            EndpointProperty.HostAndPort => $"{host}:{port}",
+            EndpointProperty.Scheme => scheme,
+            _ => $"{scheme}://{host}:{port}"
+        };
+    }
+
+    private static string GetApplicationServiceName(string projectName, string resourceName)
+    {
+        const string projectSuffix = "-project";
+        var prefix = projectName.EndsWith(projectSuffix, StringComparison.OrdinalIgnoreCase)
+            ? projectName[..^projectSuffix.Length]
+            : projectName;
+
+        return $"{prefix}-app-{resourceName}";
+    }
+
+    private static string EscapeEnvValue(string value)
+    {
+        var normalized = value
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\r", "\n", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal);
+
+        if (normalized.Length == 0)
+        {
+            return normalized;
+        }
+
+        var needsQuotes = normalized.Any(char.IsWhiteSpace)
+            || normalized.Contains('#', StringComparison.Ordinal)
+            || normalized.Contains('"', StringComparison.Ordinal)
+            || normalized.Contains('=', StringComparison.Ordinal);
+
+        if (!needsQuotes)
+        {
+            return normalized;
+        }
+
+        return $"\"{normalized.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
+    }
+
+    private async Task EnsureApplicationDomainAsync(HttpClient http, Application application, IComputeResource resource)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
         {
             throw new InvalidOperationException("Application id is required to verify domains.");
+        }
+
+        var externalEndpoints = GetExternalEndpoints(resource);
+        if (externalEndpoints.Count == 0)
+        {
+            logger.LogInformation("Application {AppName} has no external Aspire endpoints. Skipping domain creation.", application.AppName);
+            return;
         }
 
         using var byAppResponse = await http.GetAsync($"api/domain.byApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
@@ -1191,20 +1463,47 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         var generatedHost = await ReadGeneratedHostFromResponseAsync(generateResponse, logger)
             ?? throw new InvalidOperationException($"Could not parse generated domain host for application '{appNameForDomain}'.");
 
-        var createBody = JsonSerializer.Serialize(new
+        foreach (var endpoint in externalEndpoints)
         {
-            applicationId = application.Id,
-            host = generatedHost,
-            port = 8080,
-            http = false,
-            domainType = "application"
-        }, JsonOptions);
+            var createBody = JsonSerializer.Serialize(new
+            {
+                applicationId = application.Id,
+                host = generatedHost,
+                port = endpoint.Port,
+                https = endpoint.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase),
+                domainType = "application"
+            }, JsonOptions);
 
-        using var createResponse = await http.PostAsync("api/domain.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
-        createResponse.EnsureSuccessStatusCode();
+            using var createResponse = await http.PostAsync("api/domain.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
+            createResponse.EnsureSuccessStatusCode();
 
-        logger.LogInformation("Created domain {DomainHost} for application {AppName}.", generatedHost, appNameForDomain);
+            logger.LogInformation(
+                "Created domain {DomainHost} for application {AppName} using endpoint {EndpointName} ({Scheme}:{Port}).",
+                generatedHost,
+                appNameForDomain,
+                endpoint.Name,
+                endpoint.Scheme,
+                endpoint.Port);
+        }
     }
+
+    private static List<ExternalEndpointConfig> GetExternalEndpoints(IComputeResource resource)
+    {
+        var endpoints = resource.ResolveEndpoints();
+
+        return endpoints
+            .Where(e => e.Endpoint.IsExternal)
+            .Select(e => new ExternalEndpointConfig(
+                e.Endpoint.Name,
+                e.Endpoint.UriScheme,
+                e.TargetPort.Value
+                    ?? e.ExposedPort.Value
+                    ?? 8080))
+            .DistinctBy(e => $"{e.Name}|{e.Scheme}|{e.Port}")
+            .ToList();
+    }
+
+    private sealed record ExternalEndpointConfig(string Name, string Scheme, int Port);
 
     private static async Task<List<Domain>> ReadDomainsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "domain.byApplicationId")
     {
