@@ -22,3 +22,4 @@ DokployDeploy.AppHost/aspire-output/
 # OS files
 Thumbs.db
 .DS_Store
+*.cache
