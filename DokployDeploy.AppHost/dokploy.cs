@@ -82,8 +82,9 @@ public static class DokployExtensions
 
         if (builder.ExecutionContext.IsRunMode)
         {
-            return builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name, null!, registrySettings));
+            return builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name, null, null, registrySettings));
         }
+        var apiUrl = builder.AddParameter($"{name}-api-url").Resource;
 #pragma warning disable ASPIREINTERACTION001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
         var apikey = builder.AddParameter($"{name}-apiKey", secret: true)
             .WithCustomInput(ctx => new()
@@ -95,7 +96,7 @@ public static class DokployExtensions
             });
 #pragma warning restore ASPIREINTERACTION001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
 
-        var x = builder.AddResource(new DokployProjectEnvironmentResource(name, apikey.Resource, registrySettings));
+        var x = builder.AddResource(new DokployProjectEnvironmentResource(name, apikey.Resource, apiUrl, registrySettings));
 
         builder.Eventing.Subscribe<BeforeStartEvent>(async (e, ct) =>
         {
@@ -210,10 +211,14 @@ internal sealed class DokployResolvedRegistrySettings
 public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 {
     private readonly string _name;
+    private readonly ParameterResource? _apiKeyParameter;
+    private readonly ParameterResource? _apiUrlParameter;
     private readonly DokployRegistrySettings _registrySettings;
-    internal DokployProjectEnvironmentResource(string name, ParameterResource apikey, DokployRegistrySettings registrySettings) : base(name)
+    internal DokployProjectEnvironmentResource(string name, ParameterResource? apikey, ParameterResource? apiUrlParameter, DokployRegistrySettings registrySettings) : base(name)
     {
         _name = name;
+        _apiKeyParameter = apikey;
+        _apiUrlParameter = apiUrlParameter;
         _registrySettings = registrySettings;
 
 #pragma warning disable ASPIREPIPELINES001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
@@ -222,16 +227,11 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
             return [new PipelineStep() {
                Name = $"prepare-registry-{name}",
                Action = async ctx => {
-                var apiKeyVal = await apikey.GetValueAsync(ctx.CancellationToken);
-                if (string.IsNullOrWhiteSpace(apiKeyVal))
-                {
-                    throw new Exception($"API key for project {name} is not set.");
-                }
-
+                var apiKeyVal = await ResolveApiKeyAsync(ctx.CancellationToken);
+                var apiUrl = await ResolveApiUrlAsync(ctx.CancellationToken);
                 var resolvedRegistrySettings = await _registrySettings.ResolveAsync(ctx.CancellationToken);
                 ctx.Logger.LogInformation("Deploying project {ProjectName} with API key {ApiKey}", name, apiKeyVal.Substring(0, 4) + "****" + apiKeyVal.Substring(apiKeyVal.Length - 4));
-                // TODO: Add the api url as a parameter later
-                var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, resolvedRegistrySettings);
+                var api = new DokployApi(apiKeyVal, apiUrl, ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, resolvedRegistrySettings);
 
                 // We create a project for the given apphost
                 var projectName = $"{name}-project";
@@ -256,18 +256,14 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                },
                RequiredBySteps = [WellKnownPipelineSteps.Deploy],
                DependsOnSteps = [WellKnownPipelineSteps.DeployPrereq]
-           }, new PipelineStep() {
+            }, new PipelineStep() {
                Name = $"provision-apps-{name}",
                Action = async ctx => {
-                    var apiKeyVal = await apikey.GetValueAsync(ctx.CancellationToken);
-                     if (string.IsNullOrWhiteSpace(apiKeyVal))
-                     {
-                        throw new Exception($"API key for project {name} is not set.");
-                     }
-
-                    var resolvedRegistrySettings = await _registrySettings.ResolveAsync(ctx.CancellationToken);
-                    var api = new DokployApi(apiKeyVal, "http://187.77.91.200:3000/", ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, resolvedRegistrySettings);
-                    var rscs = ctx.Model.GetComputeResources();
+                     var apiKeyVal = await ResolveApiKeyAsync(ctx.CancellationToken);
+                    var apiUrl = await ResolveApiUrlAsync(ctx.CancellationToken);
+                     var resolvedRegistrySettings = await _registrySettings.ResolveAsync(ctx.CancellationToken);
+                     var api = new DokployApi(apiKeyVal, apiUrl, ctx.Services.GetRequiredService<IHostEnvironment>(), ctx.Logger, resolvedRegistrySettings);
+                     var rscs = ctx.Model.GetComputeResources();
 
                     var applications = new List<(IComputeResource Resource, DokployApi.Application Application)>();
 
@@ -311,6 +307,34 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
     public ReferenceExpression Endpoint => ReferenceExpression.Create($"{ContainerRegistryUrl}");
 
     ReferenceExpression IContainerRegistry.Name => ReferenceExpression.Create($"{_name}-registry");
+
+    private async Task<string> ResolveApiUrlAsync(CancellationToken cancellationToken)
+    {
+        var apiUrl = _apiUrlParameter is null
+            ? null
+            : await _apiUrlParameter.GetValueAsync(cancellationToken);
+
+        if (string.IsNullOrWhiteSpace(apiUrl))
+        {
+            throw new InvalidOperationException($"Dokploy API URL for project {_name} is not set.");
+        }
+
+        return apiUrl;
+    }
+
+    private async Task<string> ResolveApiKeyAsync(CancellationToken cancellationToken)
+    {
+        var apiKey = _apiKeyParameter is null
+            ? null
+            : await _apiKeyParameter.GetValueAsync(cancellationToken);
+
+        if (string.IsNullOrWhiteSpace(apiKey))
+        {
+            throw new InvalidOperationException($"API key for project {_name} is not set.");
+        }
+
+        return apiKey;
+    }
 }
 
 internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogger logger, DokployResolvedRegistrySettings registrySettings)

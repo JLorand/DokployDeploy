@@ -14,6 +14,7 @@ The integration is currently implemented directly in:
 - Supports two registry modes:
   - **Self-hosted on Dokploy** (prompts for registry domain URL during deploy).
   - **Externally hosted registry** (prompts for registry URL, username, and password during deploy).
+- Prompts for the Dokploy API URL and API key during deploy instead of hardcoding the API base URL.
 - For self-hosted registry mode, automatically ensures a compose domain for the registry using:
   - `port: 5000`
   - `https: true`
@@ -60,5 +61,5 @@ builder.AddDokployProjectHostedRegistry(name, registryUrl, username, password);
 
 ## Known limitations
 
-- Resource-to-resource environment wiring is still incomplete. (Only http works rn)
+- Resource-to-resource environment wiring is still incomplete. (Http works between services rn)
 - The integration is not yet packaged as a reusable standalone library.
