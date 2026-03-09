@@ -279,10 +279,15 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                         applications.Add((computeResource, application));
                     }
 
+                    var applicationHostsByResource = applications.ToDictionary(
+                        app => app.Resource.Name,
+                        app => string.IsNullOrWhiteSpace(app.Application.AppName) ? app.Application.Name : app.Application.AppName,
+                        StringComparer.OrdinalIgnoreCase);
+
                     // Phase 2: update docker provider, domains, and env after all applications exist.
                     foreach (var app in applications)
                     {
-                        await api.ConfigureApplicationAsync(app.Application, $"{name}-project", app.Resource, ctx.ExecutionContext, ctx.CancellationToken);
+                        await api.ConfigureApplicationAsync(app.Application, $"{name}-project", app.Resource, ctx.ExecutionContext, applicationHostsByResource, ctx.CancellationToken);
                     }
 
                     // Phase 3: start/deploy applications only after all configuration is applied.
@@ -1086,11 +1091,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         createResponse.EnsureSuccessStatusCode();
 
         var created = await ReadApplicationFromResponseAsync(createResponse);
-        if (created is not null)
-        {
-            logger.LogInformation("Created application {AppName} in project {ProjectName}.", appName, refreshedProject.Name);
-            return created;
-        }
+        logger.LogInformation("Created application {AppName} in project {ProjectName}.", appName, refreshedProject.Name);
 
         // Fallback for APIs that return ack-only payloads.
         using var verifyResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
@@ -1106,6 +1107,13 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             string.Equals(a.Name, appName, StringComparison.OrdinalIgnoreCase) ||
             string.Equals(a.AppName, appName, StringComparison.OrdinalIgnoreCase));
 
+        if (verified is null && created is not null)
+        {
+            verified = verifiedEnvironment?.Applications.FirstOrDefault(a =>
+                string.Equals(a.Name, created.Name, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(a.AppName, created.AppName, StringComparison.OrdinalIgnoreCase));
+        }
+
         if (verified is null)
         {
             throw new InvalidOperationException($"Application '{appName}' was not found after create in project '{projectName}'.");
@@ -1119,6 +1127,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         string projectName,
         IComputeResource rsc,
         DistributedApplicationExecutionContext executionContext,
+        IReadOnlyDictionary<string, string> applicationHostsByResource,
         CancellationToken cancellationToken)
     {
         using var http = CreateHttpClient();
@@ -1162,7 +1171,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
 
         logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
 
-        await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, cancellationToken);
+        await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, applicationHostsByResource, cancellationToken);
 
         await EnsureApplicationDomainAsync(http, application, rsc);
     }
@@ -1195,6 +1204,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         string projectName,
         IComputeResource resource,
         DistributedApplicationExecutionContext executionContext,
+        IReadOnlyDictionary<string, string> applicationHostsByResource,
         CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
@@ -1202,7 +1212,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             throw new InvalidOperationException("Application id is required to save environment variables.");
         }
 
-        var environmentVariables = await ResolveResourceEnvironmentAsync(resource, projectName, executionContext, cancellationToken);
+        var environmentVariables = await ResolveResourceEnvironmentAsync(resource, projectName, executionContext, applicationHostsByResource, cancellationToken);
         if (environmentVariables.Count == 0)
         {
             logger.LogInformation("No Aspire environment variables found for resource {ResourceName}.", resource.Name);
@@ -1254,6 +1264,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         IComputeResource resource,
         string projectName,
         DistributedApplicationExecutionContext executionContext,
+        IReadOnlyDictionary<string, string> applicationHostsByResource,
         CancellationToken cancellationToken)
     {
         var environmentVariables = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
@@ -1281,14 +1292,18 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
                 continue;
             }
 
-            var value = await MaterializeEnvironmentValueAsync(kv.Value, projectName, cancellationToken).ConfigureAwait(false);
+            var value = await MaterializeEnvironmentValueAsync(kv.Value, projectName, applicationHostsByResource, cancellationToken).ConfigureAwait(false);
             materialized[kv.Key] = value;
         }
 
         return materialized;
     }
 
-    private async Task<string> MaterializeEnvironmentValueAsync(object? value, string projectName, CancellationToken cancellationToken)
+    private async Task<string> MaterializeEnvironmentValueAsync(
+        object? value,
+        string projectName,
+        IReadOnlyDictionary<string, string> applicationHostsByResource,
+        CancellationToken cancellationToken)
     {
         while (true)
         {
@@ -1303,9 +1318,9 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
                 case byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal:
                     return Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
                 case EndpointReference endpointReference:
-                    return ResolveEndpointValue(endpointReference, EndpointProperty.Url, projectName);
+                    return ResolveEndpointValue(endpointReference, EndpointProperty.Url, projectName, applicationHostsByResource);
                 case EndpointReferenceExpression endpointReferenceExpression:
-                    return ResolveEndpointValue(endpointReferenceExpression.Endpoint, endpointReferenceExpression.Property, projectName);
+                    return ResolveEndpointValue(endpointReferenceExpression.Endpoint, endpointReferenceExpression.Property, projectName, applicationHostsByResource);
                 case ParameterResource parameter:
                     return await parameter.GetValueAsync(cancellationToken).ConfigureAwait(false) ?? string.Empty;
                 case ConnectionStringReference connectionStringReference:
@@ -1315,7 +1330,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
                     value = resourceWithConnectionString.ConnectionStringExpression;
                     continue;
                 case ReferenceExpression referenceExpression:
-                    return await FormatReferenceExpressionAsync(referenceExpression, projectName, cancellationToken).ConfigureAwait(false);
+                    return await FormatReferenceExpressionAsync(referenceExpression, projectName, applicationHostsByResource, cancellationToken).ConfigureAwait(false);
                 case IValueProvider valueProvider:
                     return await valueProvider.GetValueAsync(cancellationToken).ConfigureAwait(false) ?? string.Empty;
                 case IManifestExpressionProvider manifestExpressionProvider:
@@ -1326,26 +1341,34 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         }
     }
 
-    private async Task<string> FormatReferenceExpressionAsync(ReferenceExpression expression, string projectName, CancellationToken cancellationToken)
+    private async Task<string> FormatReferenceExpressionAsync(
+        ReferenceExpression expression,
+        string projectName,
+        IReadOnlyDictionary<string, string> applicationHostsByResource,
+        CancellationToken cancellationToken)
     {
         if (expression is { Format: "{0}", ValueProviders.Count: 1 })
         {
-            return await MaterializeEnvironmentValueAsync(expression.ValueProviders[0], projectName, cancellationToken).ConfigureAwait(false);
+            return await MaterializeEnvironmentValueAsync(expression.ValueProviders[0], projectName, applicationHostsByResource, cancellationToken).ConfigureAwait(false);
         }
 
         var args = new object[expression.ValueProviders.Count];
         for (var i = 0; i < expression.ValueProviders.Count; i++)
         {
-            args[i] = await MaterializeEnvironmentValueAsync(expression.ValueProviders[i], projectName, cancellationToken).ConfigureAwait(false);
+            args[i] = await MaterializeEnvironmentValueAsync(expression.ValueProviders[i], projectName, applicationHostsByResource, cancellationToken).ConfigureAwait(false);
         }
 
         return string.Format(CultureInfo.InvariantCulture, expression.Format, args);
     }
 
-    private static string ResolveEndpointValue(EndpointReference endpointReference, EndpointProperty property, string projectName)
+    private static string ResolveEndpointValue(
+        EndpointReference endpointReference,
+        EndpointProperty property,
+        string projectName,
+        IReadOnlyDictionary<string, string> applicationHostsByResource)
     {
         var referencedResource = endpointReference.Resource;
-        var host = GetApplicationServiceName(projectName, referencedResource?.Name ?? "unknown-service").ToLowerInvariant();
+        var host = GetApplicationServiceName(projectName, referencedResource?.Name ?? "unknown-service", applicationHostsByResource).ToLowerInvariant();
 
         if (referencedResource is null)
         {
@@ -1387,8 +1410,18 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         };
     }
 
-    private static string GetApplicationServiceName(string projectName, string resourceName)
+    private static string GetApplicationServiceName(
+        string projectName,
+        string resourceName,
+        IReadOnlyDictionary<string, string>? applicationHostsByResource = null)
     {
+        if (applicationHostsByResource is not null
+            && applicationHostsByResource.TryGetValue(resourceName, out var applicationHost)
+            && !string.IsNullOrWhiteSpace(applicationHost))
+        {
+            return applicationHost;
+        }
+
         const string projectSuffix = "-project";
         var prefix = projectName.EndsWith(projectSuffix, StringComparison.OrdinalIgnoreCase)
             ? projectName[..^projectSuffix.Length]
@@ -1440,12 +1473,6 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         byAppResponse.EnsureSuccessStatusCode();
 
         var existingDomains = await ReadDomainsFromResponseAsync(byAppResponse, logger, "domain.byApplicationId");
-        if (existingDomains.Count > 0)
-        {
-            logger.LogInformation("Application {AppName} already has {Count} domain(s).", application.AppName, existingDomains.Count);
-            return;
-        }
-
         var appNameForDomain = string.IsNullOrWhiteSpace(application.AppName) ? application.Name : application.AppName;
         if (string.IsNullOrWhiteSpace(appNameForDomain))
         {
@@ -1463,8 +1490,44 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         var generatedHost = await ReadGeneratedHostFromResponseAsync(generateResponse, logger)
             ?? throw new InvalidOperationException($"Could not parse generated domain host for application '{appNameForDomain}'.");
 
+        var unmatchedDomains = new List<Domain>(existingDomains);
+
         foreach (var endpoint in externalEndpoints)
         {
+            var endpointUrl = BuildApplicationEndpointUrl(generatedHost, endpoint);
+            var existingDomain = unmatchedDomains
+                .FirstOrDefault(d => string.Equals(d.Host, generatedHost, StringComparison.OrdinalIgnoreCase) && d.Port == endpoint.Port)
+                ?? unmatchedDomains.FirstOrDefault(d => d.Port == endpoint.Port)
+                ?? unmatchedDomains.FirstOrDefault();
+
+            if (existingDomain is not null)
+            {
+                unmatchedDomains.Remove(existingDomain);
+                if (string.IsNullOrWhiteSpace(existingDomain.Id))
+                {
+                    throw new InvalidOperationException($"Application domain '{existingDomain.Host}' exists for application '{appNameForDomain}' but no domainId was returned.");
+                }
+
+                var updateBody = JsonSerializer.Serialize(new
+                {
+                    domainId = existingDomain.Id,
+                    host = generatedHost,
+                    port = endpoint.Port,
+                    https = endpoint.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase),
+                    domainType = "application"
+                }, JsonOptions);
+
+                using var updateResponse = await http.PostAsync("api/domain.update", new StringContent(updateBody, Encoding.UTF8, "application/json"));
+                updateResponse.EnsureSuccessStatusCode();
+
+                logger.LogInformation(
+                    "Updated deployed application URL {EndpointUrl} for application {AppName} using endpoint {EndpointName}.",
+                    endpointUrl,
+                    appNameForDomain,
+                    endpoint.Name);
+                continue;
+            }
+
             var createBody = JsonSerializer.Serialize(new
             {
                 applicationId = application.Id,
@@ -1478,13 +1541,25 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             createResponse.EnsureSuccessStatusCode();
 
             logger.LogInformation(
-                "Created domain {DomainHost} for application {AppName} using endpoint {EndpointName} ({Scheme}:{Port}).",
-                generatedHost,
+                "Created deployed application URL {EndpointUrl} for application {AppName} using endpoint {EndpointName}.",
+                endpointUrl,
                 appNameForDomain,
-                endpoint.Name,
-                endpoint.Scheme,
-                endpoint.Port);
+                endpoint.Name);
         }
+
+        if (unmatchedDomains.Count > 0)
+        {
+            logger.LogInformation(
+                "Application {AppName} has {ExtraCount} extra existing domain(s) beyond the {ExpectedCount} external Aspire endpoint(s); leaving them unchanged.",
+                appNameForDomain,
+                unmatchedDomains.Count,
+                externalEndpoints.Count);
+        }
+    }
+
+    private static string BuildApplicationEndpointUrl(string host, ExternalEndpointConfig endpoint)
+    {
+        return $"{endpoint.Scheme}://{host}:{endpoint.Port}";
     }
 
     private static List<ExternalEndpointConfig> GetExternalEndpoints(IComputeResource resource)
@@ -1495,10 +1570,13 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             .Where(e => e.Endpoint.IsExternal)
             .Select(e => new ExternalEndpointConfig(
                 e.Endpoint.Name,
-                e.Endpoint.UriScheme,
+                e.Endpoint.UriScheme ?? "http",
                 e.TargetPort.Value
                     ?? e.ExposedPort.Value
                     ?? 8080))
+            .OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(e => e.Scheme, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(e => e.Port)
             .DistinctBy(e => $"{e.Name}|{e.Scheme}|{e.Port}")
             .ToList();
     }
@@ -1839,6 +1917,9 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
 
         [JsonPropertyName("host")]
         public string Host { get; init; } = string.Empty;
+
+        [JsonPropertyName("port")]
+        public int? Port { get; init; }
     }
 
     private sealed class TrpcEnvelope<T>

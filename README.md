@@ -20,7 +20,7 @@ The integration is currently implemented directly in:
   - `certificateType: letsencrypt`
   - idempotent host check/update via `domain.byComposeId` + `domain.update`/`domain.create`.
 - Builds and pushes app images, configures Docker provider settings, and triggers app deploys.
-- Ensures each created application has a domain (currently using a fixed port value).
+- Ensures each created application has a Dokploy-generated domain for each external Aspire endpoint while preserving the endpoint scheme and port.
 
 ## Extension methods
 
@@ -60,7 +60,5 @@ builder.AddDokployProjectHostedRegistry(name, registryUrl, username, password);
 
 ## Known limitations
 
-- Dokploy API base URL is still hardcoded in the current implementation.
-- Application domain creation currently uses a fixed port (`8080`).
-- Resource-to-resource environment wiring is still incomplete.
+- Resource-to-resource environment wiring is still incomplete. (Only http works rn)
 - The integration is not yet packaged as a reusable standalone library.
