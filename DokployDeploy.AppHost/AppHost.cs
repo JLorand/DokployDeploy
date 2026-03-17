@@ -4,7 +4,8 @@ var builder = DistributedApplication.CreateBuilder(args);
 
 builder.AddDokployProjectSelfHostedRegistry("dokploydeploy");
 
-var cache = builder.AddRedis("cache");
+var cache = builder.AddRedis("cache")
+    .WithDataVolume("cache-data");
 
 var apiService = builder.AddProject<Projects.DokployDeploy_ApiService>("apiservice")
     .WithHttpHealthCheck("/health");

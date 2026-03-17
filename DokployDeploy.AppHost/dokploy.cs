@@ -1196,6 +1196,7 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
 
         await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, applicationHostsByResource, cancellationToken);
+        await EnsureApplicationMountsAsync(http, application, rsc);
 
         await EnsureApplicationDomainAsync(http, application, rsc);
     }
@@ -1282,6 +1283,165 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
             "Saved {Count} environment variable(s) for application {AppName}.",
             environmentVariables.Count,
             resource.Name);
+    }
+
+    private async Task EnsureApplicationMountsAsync(HttpClient http, Application application, IComputeResource resource)
+    {
+        if (string.IsNullOrWhiteSpace(application.Id))
+        {
+            throw new InvalidOperationException("Application id is required to verify mounts.");
+        }
+
+        if (!resource.TryGetContainerMounts(out var containerMounts))
+        {
+            logger.LogInformation("Application {AppName} has no Aspire container mounts. Skipping mount creation.", resource.Name);
+            return;
+        }
+
+        var desiredMounts = containerMounts
+            .Select(mount => ToDesiredMount(resource, mount))
+            .DistinctBy(GetMountIdentity, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (desiredMounts.Count == 0)
+        {
+            logger.LogInformation("Application {AppName} has no supported Aspire container mounts after normalization. Skipping mount creation.", resource.Name);
+            return;
+        }
+
+        using var existingMountsResponse = await http.GetAsync($"api/mounts.allNamedByApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
+        existingMountsResponse.EnsureSuccessStatusCode();
+
+        var existingMounts = await ReadMountsFromResponseAsync(existingMountsResponse, logger);
+        var unmatchedExistingMounts = new List<Mount>(existingMounts);
+
+        foreach (var desiredMount in desiredMounts)
+        {
+            var exactMatch = unmatchedExistingMounts.FirstOrDefault(existing => MountIdentityMatches(existing, desiredMount));
+            if (exactMatch is not null)
+            {
+                unmatchedExistingMounts.Remove(exactMatch);
+                logger.LogInformation(
+                    "Mount {MountPath} for application {AppName} already exists as {MountType}.",
+                    desiredMount.MountPath,
+                    resource.Name,
+                    desiredMount.Type);
+                continue;
+            }
+
+            var targetMatch = unmatchedExistingMounts.FirstOrDefault(existing => MountLocationMatches(existing, desiredMount));
+            if (targetMatch is not null)
+            {
+                unmatchedExistingMounts.Remove(targetMatch);
+
+                if (string.IsNullOrWhiteSpace(targetMatch.Id))
+                {
+                    throw new InvalidOperationException($"Mount '{targetMatch.MountPath}' exists for application '{resource.Name}' but no mountId was returned.");
+                }
+
+                var updateBody = JsonSerializer.Serialize(new
+                {
+                    mountId = targetMatch.Id,
+                    type = desiredMount.Type,
+                    hostPath = desiredMount.HostPath,
+                    volumeName = desiredMount.VolumeName,
+                    mountPath = desiredMount.MountPath,
+                    serviceType = "application",
+                    applicationId = application.Id
+                }, JsonOptions);
+
+                using var updateResponse = await http.PostAsync("api/mounts.update", new StringContent(updateBody, Encoding.UTF8, "application/json"));
+                updateResponse.EnsureSuccessStatusCode();
+
+                logger.LogInformation(
+                    "Updated mount {MountPath} for application {AppName} to {MountType}.",
+                    desiredMount.MountPath,
+                    resource.Name,
+                    desiredMount.Type);
+                continue;
+            }
+
+            var createBody = JsonSerializer.Serialize(new
+            {
+                type = desiredMount.Type,
+                hostPath = desiredMount.HostPath,
+                volumeName = desiredMount.VolumeName,
+                mountPath = desiredMount.MountPath,
+                serviceType = "application",
+                serviceId = application.Id
+            }, JsonOptions);
+
+            using var createResponse = await http.PostAsync("api/mounts.create", new StringContent(createBody, Encoding.UTF8, "application/json"));
+            createResponse.EnsureSuccessStatusCode();
+
+            logger.LogInformation(
+                "Created mount {MountPath} for application {AppName} as {MountType}.",
+                desiredMount.MountPath,
+                resource.Name,
+                desiredMount.Type);
+        }
+
+        if (unmatchedExistingMounts.Count > 0)
+        {
+            logger.LogInformation(
+                "Application {AppName} has {ExtraCount} extra existing Dokploy mount(s) beyond the {ExpectedCount} Aspire mount(s); leaving them unchanged.",
+                resource.Name,
+                unmatchedExistingMounts.Count,
+                desiredMounts.Count);
+        }
+    }
+
+    private DokployMountSpec ToDesiredMount(IComputeResource resource, ContainerMountAnnotation mount)
+    {
+        if (mount.IsReadOnly)
+        {
+            throw new InvalidOperationException($"Resource '{resource.Name}' declares read-only mount '{mount.Target}', but Dokploy mount APIs do not expose read-only semantics.");
+        }
+
+        if (string.IsNullOrWhiteSpace(mount.Target))
+        {
+            throw new InvalidOperationException($"Resource '{resource.Name}' has a container mount with no target path.");
+        }
+
+        return mount.Type switch
+        {
+            ContainerMountType.Volume when !string.IsNullOrWhiteSpace(mount.Source) => new DokployMountSpec(
+                "volume",
+                mount.Target,
+                HostPath: null,
+                VolumeName: mount.Source),
+            ContainerMountType.BindMount when !string.IsNullOrWhiteSpace(mount.Source) => new DokployMountSpec(
+                "bind",
+                mount.Target,
+                HostPath: mount.Source,
+                VolumeName: null),
+            ContainerMountType.Volume => throw new InvalidOperationException($"Resource '{resource.Name}' has a volume mount for '{mount.Target}' without a volume name."),
+            ContainerMountType.BindMount => throw new InvalidOperationException($"Resource '{resource.Name}' has a bind mount for '{mount.Target}' without a host path."),
+            _ => throw new InvalidOperationException($"Resource '{resource.Name}' uses unsupported container mount type '{mount.Type}'.")
+        };
+    }
+
+    private static string GetMountIdentity(DokployMountSpec mount)
+    {
+        var backingPath = mount.Type.Equals("bind", StringComparison.OrdinalIgnoreCase)
+            ? mount.HostPath
+            : mount.VolumeName;
+
+        return $"{mount.Type}|{mount.MountPath}|{backingPath}";
+    }
+
+    private static bool MountIdentityMatches(Mount existingMount, DokployMountSpec desiredMount)
+    {
+        return string.Equals(existingMount.Type, desiredMount.Type, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(existingMount.MountPath, desiredMount.MountPath, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(existingMount.HostPath, desiredMount.HostPath, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(existingMount.VolumeName, desiredMount.VolumeName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool MountLocationMatches(Mount existingMount, DokployMountSpec desiredMount)
+    {
+        return string.Equals(existingMount.Type, desiredMount.Type, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(existingMount.MountPath, desiredMount.MountPath, StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<Dictionary<string, string>> ResolveResourceEnvironmentAsync(
@@ -1606,6 +1766,76 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
     }
 
     private sealed record ExternalEndpointConfig(string Name, string Scheme, int Port);
+    private sealed record DokployMountSpec(string Type, string MountPath, string? HostPath, string? VolumeName);
+
+    private static async Task<List<Mount>> ReadMountsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "mounts.allNamedByApplicationId")
+    {
+        var content = NormalizeJsonPayload(await response.Content.ReadAsStringAsync());
+        logger?.LogInformation("{MountSource} payload: {Payload}", source, GetPayloadSnippet(content));
+
+        using var root = JsonDocument.Parse(content);
+        logger?.LogInformation("{MountSource} root kind: {RootKind}", source, root.RootElement.ValueKind);
+        if (root.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            if (TryDeserializeMount(root.RootElement, out var direct))
+            {
+                return new List<Mount> { direct! };
+            }
+
+            var wrapped = JsonSerializer.Deserialize<TrpcEnvelope<List<Mount>>>(content, JsonOptions);
+            var wrappedMounts = wrapped?.Result?.Data?.Json?.Where(m => !string.IsNullOrWhiteSpace(m.MountPath)).ToList();
+            if (wrappedMounts is { Count: > 0 })
+            {
+                return wrappedMounts;
+            }
+
+            var wrappedSingle = JsonSerializer.Deserialize<TrpcEnvelope<Mount>>(content, JsonOptions);
+            var single = wrappedSingle?.Result?.Data?.Json;
+            if (single is not null && !string.IsNullOrWhiteSpace(single.MountPath))
+            {
+                return new List<Mount> { single };
+            }
+
+            return [];
+        }
+
+        var directList = JsonSerializer.Deserialize<List<Mount>>(content, JsonOptions);
+        if (directList is { Count: > 0 })
+        {
+            return directList.Where(m => !string.IsNullOrWhiteSpace(m.MountPath)).ToList();
+        }
+
+        var wrappedList = JsonSerializer.Deserialize<List<TrpcEnvelope<List<Mount>>>>(content, JsonOptions);
+        if (wrappedList is { Count: > 0 })
+        {
+            var mounts = wrappedList
+                .SelectMany(x => x.Result?.Data?.Json ?? new List<Mount>())
+                .Where(m => !string.IsNullOrWhiteSpace(m.MountPath))
+                .ToList();
+
+            if (mounts.Count > 0)
+            {
+                return mounts;
+            }
+        }
+
+        var wrappedSingleList = JsonSerializer.Deserialize<List<TrpcEnvelope<Mount>>>(content, JsonOptions);
+        if (wrappedSingleList is { Count: > 0 })
+        {
+            var mounts = wrappedSingleList
+                .Select(x => x.Result?.Data?.Json)
+                .Where(m => m is not null && !string.IsNullOrWhiteSpace(m.MountPath))
+                .Select(m => m!)
+                .ToList();
+
+            if (mounts.Count > 0)
+            {
+                return mounts;
+            }
+        }
+
+        return new List<Mount>();
+    }
 
     private static async Task<List<Domain>> ReadDomainsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "domain.byApplicationId")
     {
@@ -1835,6 +2065,23 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
         return application is not null;
     }
 
+    private static bool TryDeserializeMount(JsonElement value, out Mount? mount)
+    {
+        mount = null;
+        if (value.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!value.TryGetProperty("mountPath", out _) && !value.TryGetProperty("mountId", out _))
+        {
+            return false;
+        }
+
+        mount = value.Deserialize<Mount>(JsonOptions);
+        return mount is not null && !string.IsNullOrWhiteSpace(mount.MountPath);
+    }
+
     public class Project
     {
         [JsonPropertyName("projectId")]
@@ -1944,6 +2191,27 @@ internal class DokployApi(string apiKey, string url, IHostEnvironment env, ILogg
 
         [JsonPropertyName("port")]
         public int? Port { get; init; }
+    }
+
+    public class Mount
+    {
+        [JsonPropertyName("mountId")]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("type")]
+        public string Type { get; init; } = string.Empty;
+
+        [JsonPropertyName("hostPath")]
+        public string? HostPath { get; init; }
+
+        [JsonPropertyName("volumeName")]
+        public string? VolumeName { get; init; }
+
+        [JsonPropertyName("mountPath")]
+        public string MountPath { get; init; } = string.Empty;
+
+        [JsonPropertyName("serviceType")]
+        public string? ServiceType { get; init; }
     }
 
     private sealed class TrpcEnvelope<T>
