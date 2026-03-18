@@ -6,7 +6,7 @@ This repository contains an Aspire AppHost integration for deploying resources t
 
 The integration is currently implemented directly in:
 
-- `DokployDeploy.AppHost\\dokploy.cs`
+- `/samples/DokployDeploy.AppHost/dokploy.cs`
 
 ## Current capabilities
 
