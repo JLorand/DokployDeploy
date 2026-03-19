@@ -2,8 +2,6 @@ using Ridder.Hosting.Dokploy;
 
 var builder = DistributedApplication.CreateBuilder(args);
 
-// var dockerenv = builder.AddDockerComposeEnvironment("dockerenv");
-
 builder.AddDokployProjectSelfHostedRegistry("dokploydeploy");
 
 var cache = builder.AddRedis("cache")
