@@ -51,4 +51,28 @@ public class DokployRegistrySettingsTests
 
         Assert.Equal(expectedMessage, exception.Message);
     }
+
+    [Fact]
+    public void ResolveHostedPushPrefix_UsesUsernameNamespaceForDockerHub()
+    {
+        var prefix = DokployApi.ResolveHostedPushPrefix("docker.io", "octocat", null);
+
+        Assert.Equal("docker.io/octocat", prefix);
+    }
+
+    [Fact]
+    public void ResolveHostedPushPrefix_UsesExistingNamespacedPrefixWhenPresent()
+    {
+        var prefix = DokployApi.ResolveHostedPushPrefix("docker.io", "octocat", "docker.io/octocat");
+
+        Assert.Equal("docker.io/octocat", prefix);
+    }
+
+    [Fact]
+    public void NormalizeRegistryHost_RemovesSchemeAndSlash()
+    {
+        var host = DokployApi.NormalizeRegistryHost("https://docker.io/");
+
+        Assert.Equal("docker.io", host);
+    }
 }

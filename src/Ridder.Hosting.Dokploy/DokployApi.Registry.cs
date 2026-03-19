@@ -36,15 +36,18 @@ internal partial class DokployApi
         {
             var hostedRegistryName = $"{refreshedProject.Name}-registry";
             var linkedHostedRegistry = await EnsureRegistryLinkedAsync(http, hostedRegistryName);
+            var hostedRegistryUrl = NormalizeRegistryHost(linkedHostedRegistry?.RegistryUrl ?? GetRegistryUrl());
+            var hostedPushPrefix = ResolveHostedPushPrefix(hostedRegistryUrl, linkedHostedRegistry?.Username ?? registrySettings.Username, linkedHostedRegistry?.ImagePrefix);
             return new Registry
             {
                 RegistryId = linkedHostedRegistry?.RegistryId,
-                RegistryUrl = linkedHostedRegistry?.RegistryUrl ?? GetRegistryUrl(),
+                RegistryUrl = hostedRegistryUrl,
                 ProjectId = refreshedProject.Id,
                 EnvironmentId = targetEnvironment.Id,
                 Name = linkedHostedRegistry?.RegistryName ?? hostedRegistryName,
                 Username = linkedHostedRegistry?.Username ?? registrySettings.Username,
-                Password = linkedHostedRegistry?.Password ?? registrySettings.Password
+                Password = linkedHostedRegistry?.Password ?? registrySettings.Password,
+                PushPrefix = hostedPushPrefix
             };
         }
 
@@ -69,7 +72,8 @@ internal partial class DokployApi
                 ComposeId = existingRegistryDetails.Id ?? existingRegistry.Id,
                 Name = existingRegistryDetails.Name,
                 Username = access.Username,
-                Password = access.Password
+                Password = access.Password,
+                PushPrefix = access.RegistryUrl
             };
         }
 
@@ -120,7 +124,8 @@ internal partial class DokployApi
             ComposeId = verifiedRegistryDetails.Id ?? verifiedRegistry.Id,
             Name = verifiedRegistryDetails.Name,
             Username = verifiedAccess.Username,
-            Password = verifiedAccess.Password
+            Password = verifiedAccess.Password,
+            PushPrefix = verifiedAccess.RegistryUrl
         };
     }
 
@@ -223,9 +228,10 @@ internal partial class DokployApi
 
     private async Task<RemoteRegistry?> EnsureRegistryLinkedAsync(HttpClient http, string registryName)
     {
-        var registryUrl = GetRegistryUrl();
+        var registryUrl = NormalizeRegistryHost(GetRegistryUrl());
         var username = registrySettings.Username;
         var password = registrySettings.Password;
+        var imagePrefix = ResolveHostedPushPrefix(registryUrl, username, imagePrefix: null);
 
         var testInput = new RegistryRequestPayload
         {
@@ -256,7 +262,7 @@ internal partial class DokployApi
             password,
             registryUrl,
             registryType = registrySettings.RegistryType,
-            imagePrefix = registryUrl
+            imagePrefix
         }, JsonOptions);
 
         using var createResponse = await http.PostAsync("api/registry.create", CreateJsonContent(createBody));
@@ -295,20 +301,97 @@ internal partial class DokployApi
             registryType = payload.RegistryType
         }, JsonOptions);
 
-        logger?.LogInformation("Testing if registry URL {payload} is linked in Dokploy.", testBody);
+        logger?.LogInformation(
+            "Testing Dokploy registry link for {RegistryName} at {RegistryUrl} with username {Username}.",
+            payload.RegistryName,
+            payload.RegistryUrl,
+            payload.Username);
         using var testResponse = await http.PostAsync("api/registry.testRegistry", CreateJsonContent(testBody));
-        logger?.LogInformation("Test registry response: {StatusCode} - {ReasonPhrase}", testResponse.StatusCode, await testResponse.Content.ReadAsStringAsync());
+        var responseContent = await testResponse.Content.ReadAsStringAsync();
+        logger?.LogInformation("Test registry response: {StatusCode} - {ReasonPhrase}", testResponse.StatusCode, responseContent);
 
-        testResponse.EnsureSuccessStatusCode();
+        if (!testResponse.IsSuccessStatusCode)
+        {
+            return false;
+        }
 
-        await using var stream = await testResponse.Content.ReadAsStreamAsync();
-        using var json = await JsonDocument.ParseAsync(stream);
+        if (string.IsNullOrWhiteSpace(responseContent))
+        {
+            return false;
+        }
+
+        using var json = JsonDocument.Parse(responseContent);
         return DokployJsonPayload.ExtractLinkState(json.RootElement);
     }
 
     private string GetRegistryUrl()
     {
         return registrySettings.RegistryUrl;
+    }
+
+    internal static string ResolveHostedPushPrefix(string registryUrl, string username, string? imagePrefix)
+    {
+        var normalizedRegistry = NormalizeRegistryHost(registryUrl);
+        var normalizedPrefix = NormalizeImagePrefix(imagePrefix);
+
+        if (string.IsNullOrWhiteSpace(normalizedPrefix) || string.Equals(normalizedPrefix, normalizedRegistry, StringComparison.OrdinalIgnoreCase))
+        {
+            return RequiresRepositoryNamespace(normalizedRegistry)
+                ? $"{normalizedRegistry}/{username}"
+                : normalizedRegistry;
+        }
+
+        if (RequiresRepositoryNamespace(normalizedRegistry) && !normalizedPrefix.Contains('/', StringComparison.Ordinal))
+        {
+            return $"{normalizedRegistry}/{normalizedPrefix}";
+        }
+
+        if (!normalizedPrefix.StartsWith($"{normalizedRegistry}/", StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(normalizedPrefix, normalizedRegistry, StringComparison.OrdinalIgnoreCase)
+            && !RequiresRepositoryNamespace(normalizedRegistry))
+        {
+            return $"{normalizedRegistry}/{normalizedPrefix}";
+        }
+
+        return normalizedPrefix;
+    }
+
+    internal static string NormalizeRegistryHost(string registryUrl)
+    {
+        if (string.IsNullOrWhiteSpace(registryUrl))
+        {
+            return registryUrl;
+        }
+
+        var trimmed = registryUrl.Trim().TrimEnd('/');
+        if (Uri.TryCreate(trimmed, UriKind.Absolute, out var uri))
+        {
+            return uri.Authority;
+        }
+
+        return trimmed.Replace("https://", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("http://", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .TrimEnd('/');
+    }
+
+    private static string? NormalizeImagePrefix(string? imagePrefix)
+    {
+        if (string.IsNullOrWhiteSpace(imagePrefix))
+        {
+            return null;
+        }
+
+        return imagePrefix.Trim()
+            .Replace("https://", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .Replace("http://", string.Empty, StringComparison.OrdinalIgnoreCase)
+            .TrimEnd('/');
+    }
+
+    private static bool RequiresRepositoryNamespace(string registryUrl)
+    {
+        return string.Equals(registryUrl, "docker.io", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(registryUrl, "index.docker.io", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(registryUrl, "registry-1.docker.io", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string ResolveRegistryUsername(Compose compose, RemoteRegistry? linkedRegistry)

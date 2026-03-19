@@ -80,6 +80,8 @@ internal partial class DokployApi
 
         [JsonPropertyName("password")]
         public string? Password { get; init; }
+
+        public string PushPrefix { get; init; } = string.Empty;
     }
 
     internal sealed class RemoteRegistry

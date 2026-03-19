@@ -42,7 +42,7 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                         context.Logger.LogInformation("Project {ProjectName} exists.", project.Name);
 
                         var registry = await api.GetOrCreateRegistryAsync(project);
-                        ContainerRegistryUrl = registry.RegistryUrl;
+                        ContainerRegistryUrl = string.IsNullOrWhiteSpace(registry.PushPrefix) ? registry.RegistryUrl : registry.PushPrefix;
                         context.Logger.LogInformation("Registry for project {ProjectName} is ready.", project.Name);
 
 #pragma warning disable ASPIRECONTAINERRUNTIME001
