@@ -1,3 +1,5 @@
+using Ridder.Hosting.Dokploy;
+
 var builder = DistributedApplication.CreateBuilder(args);
 
 // var dockerenv = builder.AddDockerComposeEnvironment("dockerenv");
@@ -13,6 +15,7 @@ var apiService = builder.AddProject<Projects.DokployDeploy_ApiService>("apiservi
 builder.AddProject<Projects.DokployDeploy_Web>("webfrontend")
     .WithExternalHttpEndpoints()
     .WithHttpHealthCheck("/health")
+    .WithReference(cache)
     .WaitFor(cache)
     .WithReference(apiService)
     .WaitFor(apiService);

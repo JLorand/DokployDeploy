@@ -4,9 +4,11 @@ This repository contains an Aspire AppHost integration for deploying resources t
 
 ## Where the integration lives
 
-The integration is currently implemented directly in:
+The integration now lives in the package project:
 
-- `/samples/DokployDeploy.AppHost/dokploy.cs`
+- `/src/Ridder.Hosting.Dokploy/DokployHosting.cs`
+
+The sample AppHost in `/samples/DokployDeploy.AppHost` now consumes that package project instead of owning the implementation.
 
 ## Current capabilities
 
@@ -59,7 +61,21 @@ builder.AddDokployProjectSelfHostedRegistry(name, registryDomainUrl);
 builder.AddDokployProjectHostedRegistry(name, registryUrl, username, password);
 ```
 
+## Current rework status
+
+- The package project is now the source of truth for the Dokploy Aspire integration.
+- The sample AppHost references the package project and acts as a consumer sample.
+- Initial unit tests now cover Dokploy registry settings resolution and validation.
+- The implementation is now split into separate internal layers for extensions, resource wiring, Dokploy API behavior, and JSON/response parsing.
+
+## Current internal structure
+
+- `/src/Ridder.Hosting.Dokploy/DokployExtensions.cs` contains the public builder extension surface.
+- `/src/Ridder.Hosting.Dokploy/DokployProjectEnvironmentResource.cs` owns Aspire resource and pipeline wiring.
+- `/src/Ridder.Hosting.Dokploy/DokployApi*.cs` contains the Dokploy API orchestration split by responsibility.
+- `/src/Ridder.Hosting.Dokploy/DokployJsonPayload.cs` and `/src/Ridder.Hosting.Dokploy/DokployResponseReaders.cs` contain parsing helpers that can be unit tested independently.
+
 ## Known limitations
 
 - Resource-to-resource environment wiring is still incomplete. (Http works between services rn)
-- The integration is not yet packaged as a reusable standalone library.
+- The integration is not yet NuGet-ready; it still needs deeper behavioral coverage, more extraction around application/environment mapping, and release packaging hardening.
