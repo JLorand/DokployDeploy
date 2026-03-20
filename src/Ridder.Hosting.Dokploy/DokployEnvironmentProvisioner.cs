@@ -25,10 +25,13 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
         var apiUrlValue = await resource.ResolveApiUrlAsync(context.CancellationToken);
         var resolvedRegistrySettings = await resource.ResolveRegistrySettingsAsync(context.CancellationToken);
 
+        var maskedApiKey = apiKeyValue is { Length: >= 8 }
+            ? apiKeyValue[..4] + "****" + apiKeyValue[^4..]
+            : "****";
         context.Logger.LogInformation(
             "Deploying project {ProjectName} with API key {ApiKey}",
             resource.Name,
-            apiKeyValue.Substring(0, 4) + "****" + apiKeyValue.Substring(apiKeyValue.Length - 4));
+            maskedApiKey);
 
         var api = new DokployApi(
             apiKeyValue,
