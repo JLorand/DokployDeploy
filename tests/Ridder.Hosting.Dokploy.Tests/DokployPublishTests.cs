@@ -113,4 +113,42 @@ public class DokployPublishTests
         Assert.True(dokployNode.GetProperty("hasRegistryConfiguration").GetBoolean());
         Assert.Equal("selfhosted", dokployNode.GetProperty("registryMode").GetString());
     }
+
+    [Fact]
+    public void WithHostedRegistry_AddsHostedRegistryAnnotation()
+    {
+        var builder = DistributedApplication.CreateBuilder([]);
+        var dokploy = builder.AddDokployEnvironment("dokploy")
+            .WithHostedRegistry("ghcr.io", "octocat", "token");
+
+        var annotation = Assert.Single(dokploy.Resource.Annotations.OfType<DokployHostedRegistryAnnotation>());
+
+        Assert.Equal(DokployRegistryMode.Hosted, annotation.Mode);
+        Assert.Equal("cloud", annotation.RegistryType);
+    }
+
+    [Fact]
+    public void WithSelfHostedRegistry_ReplacesPreviousRegistryAnnotation()
+    {
+        var builder = DistributedApplication.CreateBuilder([]);
+        var dokploy = builder.AddDokployEnvironment("dokploy")
+            .WithHostedRegistry("ghcr.io", "octocat", "token")
+            .WithSelfHostedRegistry("registry.example.com");
+
+        Assert.Empty(dokploy.Resource.Annotations.OfType<DokployHostedRegistryAnnotation>());
+
+        var annotation = Assert.Single(dokploy.Resource.Annotations.OfType<DokploySelfHostedRegistryAnnotation>());
+        Assert.Equal(DokployRegistryMode.SelfHosted, annotation.Mode);
+    }
+
+    [Fact]
+    public void AddDokployEnvironment_AddsConnectionAnnotation()
+    {
+        var builder = DistributedApplication.CreateBuilder([]);
+        var dokploy = builder.AddDokployEnvironment("dokploy");
+
+        var annotation = Assert.Single(dokploy.Resource.Annotations.OfType<DokployEnvironmentConnectionAnnotation>());
+        Assert.Null(annotation.ApiKeyParameter);
+        Assert.Null(annotation.ApiUrlParameter);
+    }
 }

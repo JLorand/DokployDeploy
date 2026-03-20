@@ -42,7 +42,8 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
         context.Logger.LogInformation("Project {ProjectName} exists.", project.Name);
 
         var registry = await api.GetOrCreateRegistryAsync(project);
-        resource.SetContainerRegistryUrl(string.IsNullOrWhiteSpace(registry.PushPrefix) ? registry.RegistryUrl : registry.PushPrefix);
+        resource.ReplaceDokployRegistryAccessAnnotation(new DokployRegistryAccessAnnotation(
+            string.IsNullOrWhiteSpace(registry.PushPrefix) ? registry.RegistryUrl : registry.PushPrefix));
         context.Logger.LogInformation("Registry for project {ProjectName} is ready.", project.Name);
 
         var resources = context.Model.GetComputeResources().OfType<IComputeResource>().GetDokployComputeResources(resource);

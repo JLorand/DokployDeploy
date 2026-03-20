@@ -5,18 +5,19 @@ using Microsoft.Extensions.DependencyInjection;
 
 namespace Ridder.Hosting.Dokploy;
 
+/// <summary>
+/// Represents a Dokploy environment within an Aspire application model.
+/// </summary>
+/// <remarks>
+/// This resource also acts as an <see cref="IContainerRegistry"/> so compute resources can target the registry prepared for the Dokploy environment.
+/// </remarks>
 public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 {
     private readonly string _name;
-    private readonly ParameterResource? _apiKeyParameter;
-    private readonly ParameterResource? _apiUrlParameter;
-    private DokployRegistrySettings? _registrySettings;
 
-    internal DokployProjectEnvironmentResource(string name, ParameterResource? apiKey, ParameterResource? apiUrlParameter) : base(name)
+    internal DokployProjectEnvironmentResource(string name) : base(name)
     {
         _name = name;
-        _apiKeyParameter = apiKey;
-        _apiUrlParameter = apiUrlParameter;
 
         Annotations.Add(new ManifestPublishingCallbackAnnotation(context => DokployManifestPublishing.WriteEnvironmentManifest(context, this)));
 
@@ -52,46 +53,37 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 #pragma warning restore ASPIREPIPELINES001
     }
 
-    private string? ContainerRegistryUrl { get; set; }
+    internal DokployRegistryMode? RegistryMode => this.TryGetDokployRegistryAnnotation(out var annotation) ? annotation!.Mode : null;
+    internal string? RegistryType => this.TryGetDokployRegistryAnnotation(out var annotation) ? annotation!.RegistryType : null;
+    internal string? ApiUrlParameterName => this.GetDokployEnvironmentConnection()?.ApiUrlParameter?.Name;
+    internal string? ApiKeyParameterName => this.GetDokployEnvironmentConnection()?.ApiKeyParameter?.Name;
+    internal bool HasRegistryConfiguration => this.TryGetDokployRegistryAnnotation(out _);
 
-    internal DokployRegistryMode? RegistryMode => _registrySettings?.Mode;
-    internal string? RegistryType => _registrySettings?.RegistryType;
-    internal string? ApiUrlParameterName => _apiUrlParameter?.Name;
-    internal string? ApiKeyParameterName => _apiKeyParameter?.Name;
-    internal bool HasRegistryConfiguration => _registrySettings is not null;
-
-    public ReferenceExpression Endpoint => ReferenceExpression.Create($"{ContainerRegistryUrl}");
+    /// <summary>
+    /// Gets the registry endpoint that Aspire uses when publishing images for this Dokploy environment.
+    /// </summary>
+    public ReferenceExpression Endpoint => ReferenceExpression.Create($"{this.GetDokployRegistryAccess()?.ContainerRegistryUrl ?? string.Empty}");
 
     ReferenceExpression IContainerRegistry.Name => ReferenceExpression.Create($"{_name}-registry");
 
-    internal void ConfigureRegistry(DokployRegistrySettings registrySettings)
-    {
-        _registrySettings = registrySettings ?? throw new ArgumentNullException(nameof(registrySettings));
-    }
-
     internal string GetProjectName() => $"{_name}-project";
-
-    internal void SetContainerRegistryUrl(string? containerRegistryUrl)
-    {
-        ContainerRegistryUrl = containerRegistryUrl;
-    }
 
     internal async Task<DokployResolvedRegistrySettings> ResolveRegistrySettingsAsync(CancellationToken cancellationToken)
     {
-        if (_registrySettings is null)
+        if (!this.TryGetDokployRegistryAnnotation(out var annotation))
         {
             throw new InvalidOperationException($"Dokploy environment '{_name}' does not have a registry configuration. Call WithHostedRegistry(...) or WithSelfHostedRegistry(...).");
         }
 
-        return await _registrySettings.ResolveAsync(cancellationToken);
+        return await annotation!.ResolveAsync(cancellationToken);
     }
 
     internal async Task<string> ResolveApiUrlAsync(CancellationToken cancellationToken)
     {
-        var apiUrl = _apiUrlParameter is null
-            ? null
-            : await _apiUrlParameter.GetValueAsync(cancellationToken);
+        var connection = this.GetDokployEnvironmentConnection()
+            ?? throw new InvalidOperationException($"Dokploy environment '{_name}' does not have an API connection annotation.");
 
+        var apiUrl = await connection.ResolveApiUrlAsync(_name, cancellationToken);
         if (string.IsNullOrWhiteSpace(apiUrl))
         {
             throw new InvalidOperationException($"Dokploy API URL for project {_name} is not set.");
@@ -102,10 +94,10 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 
     internal async Task<string> ResolveApiKeyAsync(CancellationToken cancellationToken)
     {
-        var apiKey = _apiKeyParameter is null
-            ? null
-            : await _apiKeyParameter.GetValueAsync(cancellationToken);
+        var connection = this.GetDokployEnvironmentConnection()
+            ?? throw new InvalidOperationException($"Dokploy environment '{_name}' does not have an API connection annotation.");
 
+        var apiKey = await connection.ResolveApiKeyAsync(_name, cancellationToken);
         if (string.IsNullOrWhiteSpace(apiKey))
         {
             throw new InvalidOperationException($"API key for project {_name} is not set.");

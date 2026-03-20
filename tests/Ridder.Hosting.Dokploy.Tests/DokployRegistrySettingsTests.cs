@@ -5,11 +5,11 @@ namespace Ridder.Hosting.Dokploy.Tests;
 public class DokployRegistrySettingsTests
 {
     [Fact]
-    public async Task CreateSelfHosted_WithExplicitValues_ResolvesExpectedSettings()
+    public async Task SelfHostedRegistryAnnotation_WithExplicitValues_ResolvesExpectedSettings()
     {
-        var settings = DokployRegistrySettings.CreateSelfHosted("registry.example.com", "docker", "password");
+        var annotation = new DokploySelfHostedRegistryAnnotation("registry.example.com", "docker", "password");
 
-        var resolved = await settings.ResolveAsync(CancellationToken.None);
+        var resolved = await annotation.ResolveAsync(CancellationToken.None);
 
         Assert.Equal(DokployRegistryMode.SelfHosted, resolved.Mode);
         Assert.Equal("registry.example.com", resolved.RegistryUrl);
@@ -19,11 +19,11 @@ public class DokployRegistrySettingsTests
     }
 
     [Fact]
-    public async Task CreateHosted_WithExplicitValues_ResolvesExpectedSettings()
+    public async Task HostedRegistryAnnotation_WithExplicitValues_ResolvesExpectedSettings()
     {
-        var settings = DokployRegistrySettings.CreateHosted("ghcr.io", "octocat", "token");
+        var annotation = new DokployHostedRegistryAnnotation("ghcr.io", "octocat", "token");
 
-        var resolved = await settings.ResolveAsync(CancellationToken.None);
+        var resolved = await annotation.ResolveAsync(CancellationToken.None);
 
         Assert.Equal(DokployRegistryMode.Hosted, resolved.Mode);
         Assert.Equal("ghcr.io", resolved.RegistryUrl);
@@ -39,15 +39,15 @@ public class DokployRegistrySettingsTests
     [InlineData("registry.example.com", "", "password", "Registry username is required.")]
     [InlineData("registry.example.com", "user", null, "Registry password is required.")]
     [InlineData("registry.example.com", "user", "", "Registry password is required.")]
-    public async Task CreateHosted_WithMissingRequiredValue_Throws(
+    public async Task HostedRegistryAnnotation_WithMissingRequiredValue_Throws(
         string? registryUrl,
         string? username,
         string? password,
         string expectedMessage)
     {
-        var settings = DokployRegistrySettings.CreateHosted(registryUrl ?? string.Empty, username ?? string.Empty, password ?? string.Empty);
+        var annotation = new DokployHostedRegistryAnnotation(registryUrl ?? string.Empty, username ?? string.Empty, password ?? string.Empty);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => settings.ResolveAsync(CancellationToken.None));
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => annotation.ResolveAsync(CancellationToken.None));
 
         Assert.Equal(expectedMessage, exception.Message);
     }

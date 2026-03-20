@@ -8,11 +8,24 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 
 namespace Ridder.Hosting.Dokploy;
 
+/// <summary>
+/// Provides Aspire builder extensions for configuring Dokploy environments and publishing compute resources to Dokploy.
+/// </summary>
 public static class DokployExtensions
 {
     private const string DefaultRegistryUsername = "docker";
     private const string DefaultRegistryPassword = "password";
 
+    /// <summary>
+    /// Adds a Dokploy environment resource to the distributed application.
+    /// </summary>
+    /// <remarks>
+    /// After creating the environment, configure a registry by calling <see cref="WithSelfHostedRegistry(IResourceBuilder{DokployProjectEnvironmentResource})"/>
+    /// or <see cref="WithHostedRegistry(IResourceBuilder{DokployProjectEnvironmentResource})"/> before publishing resources to Dokploy.
+    /// </remarks>
+    /// <param name="builder">The distributed application builder.</param>
+    /// <param name="name">The logical name of the Dokploy environment.</param>
+    /// <returns>A resource builder for configuring the Dokploy environment.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployEnvironment(this IDistributedApplicationBuilder builder, string name)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -20,15 +33,18 @@ public static class DokployExtensions
 
         builder.Services.TryAddSingleton<IDokployEnvironmentProvisioner, DokployEnvironmentProvisioner>();
 
+        ParameterResource? apiUrlParameter = null;
+        ParameterResource? apiKeyParameter = null;
+
         IResourceBuilder<DokployProjectEnvironmentResource> resourceBuilder;
 
         if (builder.ExecutionContext.IsRunMode)
         {
-            resourceBuilder = builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name, null, null));
+            resourceBuilder = builder.CreateResourceBuilder(new DokployProjectEnvironmentResource(name));
         }
         else
         {
-            var apiUrl = builder.AddParameter($"{name}-api-url").Resource;
+            apiUrlParameter = builder.AddParameter($"{name}-api-url").Resource;
 
 #pragma warning disable ASPIREINTERACTION001
             var apiKey = builder.AddParameter($"{name}-apiKey", secret: true)
@@ -41,8 +57,12 @@ public static class DokployExtensions
                 });
 #pragma warning restore ASPIREINTERACTION001
 
-            resourceBuilder = builder.AddResource(new DokployProjectEnvironmentResource(name, apiKey.Resource, apiUrl));
+            apiKeyParameter = apiKey.Resource;
+
+            resourceBuilder = builder.AddResource(new DokployProjectEnvironmentResource(name));
         }
+
+        resourceBuilder.WithAnnotation(new DokployEnvironmentConnectionAnnotation(apiKeyParameter, apiUrlParameter), ResourceAnnotationMutationBehavior.Replace);
 
         builder.Eventing.Subscribe<BeforeStartEvent>(async (beforeStart, cancellationToken) =>
         {
@@ -67,21 +87,34 @@ public static class DokployExtensions
         return resourceBuilder;
     }
 
+    /// <summary>
+    /// Configures the Dokploy environment to use a Dokploy-hosted container registry.
+    /// </summary>
+    /// <param name="builder">The Dokploy environment builder.</param>
+    /// <returns>The same builder instance for chaining.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> WithSelfHostedRegistry(this IResourceBuilder<DokployProjectEnvironmentResource> builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
         if (builder.ApplicationBuilder.ExecutionContext.IsRunMode)
         {
-            builder.Resource.ConfigureRegistry(DokployRegistrySettings.CreateSelfHosted(string.Empty, DefaultRegistryUsername, DefaultRegistryPassword));
+            builder.Resource.ReplaceDokployRegistryAnnotation(
+                new DokploySelfHostedRegistryAnnotation(string.Empty, DefaultRegistryUsername, DefaultRegistryPassword));
             return builder;
         }
 
         var registryDomainParameter = builder.ApplicationBuilder.AddParameter($"{builder.Resource.Name}-registry-domain-url").Resource;
-        builder.Resource.ConfigureRegistry(DokployRegistrySettings.CreateSelfHosted(registryDomainParameter, DefaultRegistryUsername, DefaultRegistryPassword));
+        builder.Resource.ReplaceDokployRegistryAnnotation(
+            new DokploySelfHostedRegistryAnnotation(registryDomainParameter, DefaultRegistryUsername, DefaultRegistryPassword));
         return builder;
     }
 
+    /// <summary>
+    /// Configures the Dokploy environment to use a Dokploy-hosted container registry with an explicit registry domain.
+    /// </summary>
+    /// <param name="builder">The Dokploy environment builder.</param>
+    /// <param name="registryDomainUrl">The external registry domain used by Dokploy to host images.</param>
+    /// <returns>The same builder instance for chaining.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> WithSelfHostedRegistry(this IResourceBuilder<DokployProjectEnvironmentResource> builder, string registryDomainUrl)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -91,18 +124,25 @@ public static class DokployExtensions
             throw new ArgumentException("A registry domain URL is required for a self-hosted Dokploy registry.", nameof(registryDomainUrl));
         }
 
-        builder.Resource.ConfigureRegistry(DokployRegistrySettings.CreateSelfHosted(registryDomainUrl, DefaultRegistryUsername, DefaultRegistryPassword));
+        builder.Resource.ReplaceDokployRegistryAnnotation(
+            new DokploySelfHostedRegistryAnnotation(registryDomainUrl, DefaultRegistryUsername, DefaultRegistryPassword));
         return builder;
     }
 
 #pragma warning disable ASPIREINTERACTION001
+    /// <summary>
+    /// Configures the Dokploy environment to use an existing hosted container registry.
+    /// </summary>
+    /// <param name="builder">The Dokploy environment builder.</param>
+    /// <returns>The same builder instance for chaining.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> WithHostedRegistry(this IResourceBuilder<DokployProjectEnvironmentResource> builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
 
         if (builder.ApplicationBuilder.ExecutionContext.IsRunMode)
         {
-            builder.Resource.ConfigureRegistry(DokployRegistrySettings.CreateHosted(string.Empty, string.Empty, string.Empty));
+            builder.Resource.ReplaceDokployRegistryAnnotation(
+                new DokployHostedRegistryAnnotation(string.Empty, string.Empty, string.Empty));
             return builder;
         }
 
@@ -116,11 +156,20 @@ public static class DokployExtensions
             Placeholder = "CoolPassword123"
         }).Resource;
 
-        builder.Resource.ConfigureRegistry(DokployRegistrySettings.CreateHosted(registryUrlParameter, registryUsernameParameter, registryPasswordParameter));
+        builder.Resource.ReplaceDokployRegistryAnnotation(
+            new DokployHostedRegistryAnnotation(registryUrlParameter, registryUsernameParameter, registryPasswordParameter));
         return builder;
     }
 #pragma warning restore ASPIREINTERACTION001
 
+    /// <summary>
+    /// Configures the Dokploy environment to use an existing hosted container registry with explicit credentials.
+    /// </summary>
+    /// <param name="builder">The Dokploy environment builder.</param>
+    /// <param name="registryUrl">The base URL of the registry.</param>
+    /// <param name="username">The username used to push images to the registry.</param>
+    /// <param name="password">The password used to push images to the registry.</param>
+    /// <returns>The same builder instance for chaining.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> WithHostedRegistry(this IResourceBuilder<DokployProjectEnvironmentResource> builder, string registryUrl, string username, string password)
     {
         ArgumentNullException.ThrowIfNull(builder);
@@ -140,16 +189,32 @@ public static class DokployExtensions
             throw new ArgumentException("A registry password is required for a hosted registry.", nameof(password));
         }
 
-        builder.Resource.ConfigureRegistry(DokployRegistrySettings.CreateHosted(registryUrl, username, password));
+        builder.Resource.ReplaceDokployRegistryAnnotation(
+            new DokployHostedRegistryAnnotation(registryUrl, username, password));
         return builder;
     }
 
+    /// <summary>
+    /// Publishes a compute resource to Dokploy using the default Dokploy application options.
+    /// </summary>
+    /// <typeparam name="T">The resource type.</typeparam>
+    /// <param name="builder">The compute resource builder.</param>
+    /// <param name="environmentBuilder">The Dokploy environment that should provision the resource.</param>
+    /// <returns>The same builder instance for chaining.</returns>
     public static IResourceBuilder<T> PublishToDokploy<T>(this IResourceBuilder<T> builder, IResourceBuilder<DokployProjectEnvironmentResource> environmentBuilder)
         where T : IResource, IComputeResource
     {
         return PublishToDokploy(builder, environmentBuilder, static _ => { });
     }
 
+    /// <summary>
+    /// Publishes a compute resource to Dokploy and configures Dokploy-specific application options.
+    /// </summary>
+    /// <typeparam name="T">The resource type.</typeparam>
+    /// <param name="builder">The compute resource builder.</param>
+    /// <param name="environmentBuilder">The Dokploy environment that should provision the resource.</param>
+    /// <param name="configure">An action that configures Dokploy application options for the resource.</param>
+    /// <returns>The same builder instance for chaining.</returns>
     public static IResourceBuilder<T> PublishToDokploy<T>(this IResourceBuilder<T> builder, IResourceBuilder<DokployProjectEnvironmentResource> environmentBuilder, Action<DokployApplicationOptions> configure)
         where T : IResource, IComputeResource
     {
@@ -175,16 +240,35 @@ public static class DokployExtensions
         return builder;
     }
 
+    /// <summary>
+    /// Adds a Dokploy environment using the legacy convenience API and configures it for a Dokploy-hosted registry.
+    /// </summary>
+    /// <param name="builder">The distributed application builder.</param>
+    /// <param name="name">The logical name of the Dokploy environment.</param>
+    /// <returns>A resource builder for configuring the Dokploy environment.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProject(this IDistributedApplicationBuilder builder, string name)
     {
         return builder.AddDokployEnvironment(name).WithSelfHostedRegistry();
     }
 
+    /// <summary>
+    /// Adds a Dokploy environment using the legacy convenience API and configures it for a Dokploy-hosted registry.
+    /// </summary>
+    /// <param name="builder">The distributed application builder.</param>
+    /// <param name="name">The logical name of the Dokploy environment.</param>
+    /// <returns>A resource builder for configuring the Dokploy environment.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectSelfHostedRegistry(this IDistributedApplicationBuilder builder, string name)
     {
         return builder.AddDokployEnvironment(name).WithSelfHostedRegistry();
     }
 
+    /// <summary>
+    /// Adds a Dokploy environment using the legacy convenience API and configures it for a Dokploy-hosted registry with an explicit domain.
+    /// </summary>
+    /// <param name="builder">The distributed application builder.</param>
+    /// <param name="name">The logical name of the Dokploy environment.</param>
+    /// <param name="registryDomainUrl">The external registry domain used by Dokploy to host images.</param>
+    /// <returns>A resource builder for configuring the Dokploy environment.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectSelfHostedRegistry(this IDistributedApplicationBuilder builder, string name, string registryDomainUrl)
     {
         if (string.IsNullOrWhiteSpace(registryDomainUrl))
@@ -196,12 +280,27 @@ public static class DokployExtensions
     }
 
 #pragma warning disable ASPIREINTERACTION001
+    /// <summary>
+    /// Adds a Dokploy environment using the legacy convenience API and configures it for an existing hosted registry.
+    /// </summary>
+    /// <param name="builder">The distributed application builder.</param>
+    /// <param name="name">The logical name of the Dokploy environment.</param>
+    /// <returns>A resource builder for configuring the Dokploy environment.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectHostedRegistry(this IDistributedApplicationBuilder builder, string name)
     {
         return builder.AddDokployEnvironment(name).WithHostedRegistry();
     }
 #pragma warning restore ASPIREINTERACTION001
 
+    /// <summary>
+    /// Adds a Dokploy environment using the legacy convenience API and configures it for an existing hosted registry with explicit credentials.
+    /// </summary>
+    /// <param name="builder">The distributed application builder.</param>
+    /// <param name="name">The logical name of the Dokploy environment.</param>
+    /// <param name="registryUrl">The base URL of the registry.</param>
+    /// <param name="username">The username used to push images to the registry.</param>
+    /// <param name="password">The password used to push images to the registry.</param>
+    /// <returns>A resource builder for configuring the Dokploy environment.</returns>
     public static IResourceBuilder<DokployProjectEnvironmentResource> AddDokployProjectHostedRegistry(this IDistributedApplicationBuilder builder, string name, string registryUrl, string username, string password)
     {
         if (string.IsNullOrWhiteSpace(registryUrl))
