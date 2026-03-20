@@ -386,7 +386,60 @@ internal partial class DokployApi
             materialized[kv.Key] = value;
         }
 
-        return materialized;
+        var normalized = NormalizeDokployEnvironmentVariables(materialized, applicationHostsByResource);
+
+        if (normalized.Count != materialized.Count)
+        {
+            logger.LogInformation(
+                "Removed {RemovedCount} invalid internal HTTPS environment variable(s) for resource {ResourceName} because Dokploy service-to-service traffic is published as HTTP.",
+                materialized.Count - normalized.Count,
+                resource.Name);
+        }
+
+        return normalized;
+    }
+
+    internal static Dictionary<string, string> NormalizeDokployEnvironmentVariables(
+        IReadOnlyDictionary<string, string> environmentVariables,
+        IReadOnlyDictionary<string, string> applicationHostsByResource)
+    {
+        var internalHosts = applicationHostsByResource.Values
+            .Where(host => !string.IsNullOrWhiteSpace(host))
+            .Select(host => host.Trim().ToLowerInvariant())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        if (internalHosts.Count == 0)
+        {
+            return new Dictionary<string, string>(environmentVariables, StringComparer.OrdinalIgnoreCase);
+        }
+
+        var normalized = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var environmentVariable in environmentVariables)
+        {
+            if (ShouldSuppressInternalHttpsEnvironmentVariable(environmentVariable.Key, environmentVariable.Value, internalHosts))
+            {
+                continue;
+            }
+
+            normalized[environmentVariable.Key] = environmentVariable.Value;
+        }
+
+        return normalized;
+    }
+
+    private static bool ShouldSuppressInternalHttpsEnvironmentVariable(string key, string value, HashSet<string> internalHosts)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri)
+            || !uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase)
+            || string.IsNullOrWhiteSpace(uri.Host)
+            || !internalHosts.Contains(uri.Host))
+        {
+            return false;
+        }
+
+        return key.Contains("__https__", StringComparison.OrdinalIgnoreCase)
+            || key.EndsWith("_HTTPS", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<string> MaterializeEnvironmentValueAsync(

@@ -151,4 +151,30 @@ public class DokployPublishTests
         Assert.Null(annotation.ApiKeyParameter);
         Assert.Null(annotation.ApiUrlParameter);
     }
+
+    [Fact]
+    public void NormalizeDokployEnvironmentVariables_RemovesInvalidInternalHttpsEndpoints()
+    {
+        var environmentVariables = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["APISERVICE_HTTP"] = "http://dokploydeploy-app-apiservice-dvbjux:8080",
+            ["APISERVICE_HTTPS"] = "https://dokploydeploy-app-apiservice-dvbjux:8080",
+            ["services__apiservice__http__0"] = "http://dokploydeploy-app-apiservice-dvbjux:8080",
+            ["services__apiservice__https__0"] = "https://dokploydeploy-app-apiservice-dvbjux:8080",
+            ["services__publicapi__https__0"] = "https://api.example.com"
+        };
+
+        var applicationHostsByResource = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["apiservice"] = "dokploydeploy-app-apiservice-dvbjux"
+        };
+
+        var normalized = DokployApi.NormalizeDokployEnvironmentVariables(environmentVariables, applicationHostsByResource);
+
+        Assert.Equal("http://dokploydeploy-app-apiservice-dvbjux:8080", normalized["APISERVICE_HTTP"]);
+        Assert.Equal("http://dokploydeploy-app-apiservice-dvbjux:8080", normalized["services__apiservice__http__0"]);
+        Assert.DoesNotContain("APISERVICE_HTTPS", normalized.Keys, StringComparer.OrdinalIgnoreCase);
+        Assert.DoesNotContain("services__apiservice__https__0", normalized.Keys, StringComparer.OrdinalIgnoreCase);
+        Assert.Equal("https://api.example.com", normalized["services__publicapi__https__0"]);
+    }
 }
