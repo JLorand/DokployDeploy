@@ -47,7 +47,7 @@ public static class DokployExtensions
             apiUrlParameter = builder.AddParameter($"{name}-api-url").Resource;
 
 #pragma warning disable ASPIREINTERACTION001
-            var apiKey = builder.AddParameter($"{name}-apiKey", secret: true)
+            var apiKey = builder.AddParameter($"{name}-api-key", secret: true)
                 .WithCustomInput(ctx => new()
                 {
                     InputType = InputType.SecretText,
