@@ -98,11 +98,8 @@ internal static class DokployResourceExtensions
         ArgumentNullException.ThrowIfNull(computeResources);
         ArgumentNullException.ThrowIfNull(environment);
 
-        var allResources = computeResources.ToList();
-        var targetedResources = allResources
+        return computeResources
             .Where(resource => resource.TryGetDokployPublishAnnotation(environment, out _))
             .ToList();
-
-        return targetedResources.Count > 0 ? targetedResources : allResources;
     }
 }
