@@ -6,21 +6,28 @@ using System.Text;
 
 namespace Ridder.Hosting.Dokploy;
 
-internal partial class DokployApi
+internal partial class DokployApi : IDisposable
 {
-    private readonly string apiKey;
-    private readonly string url;
     private readonly IHostEnvironment env;
     private readonly ILogger logger;
     private readonly DokployResolvedRegistrySettings registrySettings;
+    private readonly HttpClient http;
 
     internal DokployApi(string apiKey, string url, IHostEnvironment env, ILogger logger, DokployResolvedRegistrySettings registrySettings)
     {
-        this.apiKey = apiKey;
-        this.url = url;
         this.env = env;
         this.logger = logger;
         this.registrySettings = registrySettings;
+
+        var baseUrl = url.EndsWith("/", StringComparison.Ordinal) ? url : $"{url}/";
+        http = new HttpClient
+        {
+            BaseAddress = new Uri(baseUrl, UriKind.Absolute),
+            Timeout = TimeSpan.FromMinutes(5)
+        };
+        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        http.DefaultRequestHeaders.Add("x-api-key", apiKey);
     }
 
     internal static readonly JsonSerializerOptions JsonOptions = new()
@@ -28,18 +35,10 @@ internal partial class DokployApi
         PropertyNameCaseInsensitive = true
     };
 
-    private HttpClient CreateHttpClient()
+    public void Dispose()
     {
-        var baseUrl = url.EndsWith("/", StringComparison.Ordinal) ? url : $"{url}/";
-        var http = new HttpClient
-        {
-            BaseAddress = new Uri(baseUrl, UriKind.Absolute)
-        };
-
-        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-        http.DefaultRequestHeaders.Add("x-api-key", apiKey);
-        return http;
+        http.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     private static StringContent CreateJsonContent(string body)

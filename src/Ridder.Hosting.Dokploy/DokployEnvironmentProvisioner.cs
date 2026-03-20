@@ -30,7 +30,7 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
             resource.Name,
             apiKeyValue.Substring(0, 4) + "****" + apiKeyValue.Substring(apiKeyValue.Length - 4));
 
-        var api = new DokployApi(
+        using var api = new DokployApi(
             apiKeyValue,
             apiUrlValue,
             context.Services.GetRequiredService<IHostEnvironment>(),
@@ -71,7 +71,7 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
         var apiKeyValue = await resource.ResolveApiKeyAsync(context.CancellationToken);
         var apiUrlValue = await resource.ResolveApiUrlAsync(context.CancellationToken);
         var resolvedRegistrySettings = await resource.ResolveRegistrySettingsAsync(context.CancellationToken);
-        var api = new DokployApi(
+        using var api = new DokployApi(
             apiKeyValue,
             apiUrlValue,
             context.Services.GetRequiredService<IHostEnvironment>(),
