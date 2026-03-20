@@ -107,6 +107,8 @@ internal partial class DokployApi
     {
         using var http = CreateHttpClient();
 
+        rsc.TryGetDokployPublishAnnotation(out var publishAnnotation);
+
         if (string.IsNullOrWhiteSpace(application.Id))
         {
             throw new InvalidOperationException($"Application '{rsc.Name}' has no applicationId, so provider cannot be configured.");
@@ -143,9 +145,20 @@ internal partial class DokployApi
         saveDockerProviderResponse.EnsureSuccessStatusCode();
         logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
 
-        await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, applicationHostsByResource, cancellationToken);
-        await EnsureApplicationMountsAsync(http, application, rsc);
-        await EnsureApplicationDomainAsync(http, application, rsc);
+        if (publishAnnotation?.Options.ConfigureEnvironmentVariables ?? true)
+        {
+            await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, applicationHostsByResource, cancellationToken);
+        }
+
+        if (publishAnnotation?.Options.ConfigureMounts ?? true)
+        {
+            await EnsureApplicationMountsAsync(http, application, rsc);
+        }
+
+        if (publishAnnotation?.Options.CreateDomainsForExternalEndpoints ?? true)
+        {
+            await EnsureApplicationDomainAsync(http, application, rsc);
+        }
     }
 
     internal async Task DeployApplicationAsync(Application application, IComputeResource rsc)
@@ -328,25 +341,17 @@ internal partial class DokployApi
 
     private static string GetMountIdentity(DokployMountSpec mount)
     {
-        var backingPath = mount.Type.Equals("bind", StringComparison.OrdinalIgnoreCase)
-            ? mount.HostPath
-            : mount.VolumeName;
-
-        return $"{mount.Type}|{mount.MountPath}|{backingPath}";
+        return DokployMountReconciler.GetMountIdentity(mount.Type, mount.MountPath, mount.HostPath, mount.VolumeName);
     }
 
     private static bool MountIdentityMatches(Mount existingMount, DokployMountSpec desiredMount)
     {
-        return string.Equals(existingMount.Type, desiredMount.Type, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(existingMount.MountPath, desiredMount.MountPath, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(existingMount.HostPath, desiredMount.HostPath, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(existingMount.VolumeName, desiredMount.VolumeName, StringComparison.OrdinalIgnoreCase);
+        return DokployMountReconciler.MountIdentityMatches(existingMount, desiredMount.Type, desiredMount.MountPath, desiredMount.HostPath, desiredMount.VolumeName);
     }
 
     private static bool MountLocationMatches(Mount existingMount, DokployMountSpec desiredMount)
     {
-        return string.Equals(existingMount.Type, desiredMount.Type, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(existingMount.MountPath, desiredMount.MountPath, StringComparison.OrdinalIgnoreCase);
+        return DokployMountReconciler.MountLocationMatches(existingMount, desiredMount.MountPath);
     }
 
     private async Task<Dictionary<string, string>> ResolveResourceEnvironmentAsync(

@@ -122,20 +122,66 @@ internal partial class DokployApi
 
     public class Mount
     {
+        private string? _type;
+        private string? _hostPath;
+        private string? _volumeName;
+        private string? _mountPath;
+
         [JsonPropertyName("mountId")]
         public string? Id { get; init; }
 
         [JsonPropertyName("type")]
-        public string Type { get; init; } = string.Empty;
+        public string Type
+        {
+            get => _type ?? string.Empty;
+            init => _type = value;
+        }
 
         [JsonPropertyName("hostPath")]
-        public string? HostPath { get; init; }
+        public string? HostPath
+        {
+            get
+            {
+                if (!string.IsNullOrWhiteSpace(_hostPath))
+                {
+                    return _hostPath;
+                }
+
+                return string.Equals(Type, "bind", StringComparison.OrdinalIgnoreCase) ? Source : null;
+            }
+            init => _hostPath = value;
+        }
+
+        [JsonPropertyName("source")]
+        public string? Source { get; init; }
 
         [JsonPropertyName("volumeName")]
-        public string? VolumeName { get; init; }
+        public string? VolumeName
+        {
+            get
+            {
+                if (!string.IsNullOrWhiteSpace(_volumeName))
+                {
+                    return _volumeName;
+                }
+
+                return string.Equals(Type, "volume", StringComparison.OrdinalIgnoreCase) ? Name : null;
+            }
+            init => _volumeName = value;
+        }
+
+        [JsonPropertyName("name")]
+        public string? Name { get; init; }
 
         [JsonPropertyName("mountPath")]
-        public string MountPath { get; init; } = string.Empty;
+        public string MountPath
+        {
+            get => _mountPath ?? Destination ?? string.Empty;
+            init => _mountPath = value;
+        }
+
+        [JsonPropertyName("destination")]
+        public string? Destination { get; init; }
 
         [JsonPropertyName("serviceType")]
         public string? ServiceType { get; init; }

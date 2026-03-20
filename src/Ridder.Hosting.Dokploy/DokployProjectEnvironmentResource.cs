@@ -2,8 +2,6 @@ using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Pipelines;
 using Aspire.Hosting.Publishing;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 namespace Ridder.Hosting.Dokploy;
 
@@ -12,14 +10,15 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
     private readonly string _name;
     private readonly ParameterResource? _apiKeyParameter;
     private readonly ParameterResource? _apiUrlParameter;
-    private readonly DokployRegistrySettings _registrySettings;
+    private DokployRegistrySettings? _registrySettings;
 
-    internal DokployProjectEnvironmentResource(string name, ParameterResource? apiKey, ParameterResource? apiUrlParameter, DokployRegistrySettings registrySettings) : base(name)
+    internal DokployProjectEnvironmentResource(string name, ParameterResource? apiKey, ParameterResource? apiUrlParameter) : base(name)
     {
         _name = name;
         _apiKeyParameter = apiKey;
         _apiUrlParameter = apiUrlParameter;
-        _registrySettings = registrySettings;
+
+        Annotations.Add(new ManifestPublishingCallbackAnnotation(context => DokployManifestPublishing.WriteEnvironmentManifest(context, this)));
 
 #pragma warning disable ASPIREPIPELINES001
         Annotations.Add(new PipelineStepAnnotation(ctx =>
@@ -31,28 +30,8 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                     Name = $"prepare-registry-{name}",
                     Action = async context =>
                     {
-                        var apiKeyValue = await ResolveApiKeyAsync(context.CancellationToken);
-                        var apiUrlValue = await ResolveApiUrlAsync(context.CancellationToken);
-                        var resolvedRegistrySettings = await _registrySettings.ResolveAsync(context.CancellationToken);
-                        context.Logger.LogInformation("Deploying project {ProjectName} with API key {ApiKey}", name, apiKeyValue.Substring(0, 4) + "****" + apiKeyValue.Substring(apiKeyValue.Length - 4));
-
-                        var api = new DokployApi(apiKeyValue, apiUrlValue, context.Services.GetRequiredService<IHostEnvironment>(), context.Logger, resolvedRegistrySettings);
-                        var projectName = $"{name}-project";
-                        var project = await api.GetProjectOrCreateAsync(projectName);
-                        context.Logger.LogInformation("Project {ProjectName} exists.", project.Name);
-
-                        var registry = await api.GetOrCreateRegistryAsync(project);
-                        ContainerRegistryUrl = string.IsNullOrWhiteSpace(registry.PushPrefix) ? registry.RegistryUrl : registry.PushPrefix;
-                        context.Logger.LogInformation("Registry for project {ProjectName} is ready.", project.Name);
-
-#pragma warning disable ASPIRECONTAINERRUNTIME001
-                        var containerRuntime = context.Services.GetRequiredService<IContainerRuntime>();
-#pragma warning restore ASPIRECONTAINERRUNTIME001
-                        await containerRuntime.LoginToRegistryAsync(
-                            registry.RegistryUrl,
-                            registry.Username ?? resolvedRegistrySettings.Username,
-                            registry.Password ?? resolvedRegistrySettings.Password,
-                            context.CancellationToken);
+                        var provisioner = context.Services.GetRequiredService<IDokployEnvironmentProvisioner>();
+                        await provisioner.PrepareRegistryAsync(this, context);
                     },
                     RequiredBySteps = [WellKnownPipelineSteps.Deploy],
                     DependsOnSteps = [WellKnownPipelineSteps.DeployPrereq]
@@ -62,35 +41,8 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                     Name = $"provision-apps-{name}",
                     Action = async context =>
                     {
-                        var apiKeyValue = await ResolveApiKeyAsync(context.CancellationToken);
-                        var apiUrlValue = await ResolveApiUrlAsync(context.CancellationToken);
-                        var resolvedRegistrySettings = await _registrySettings.ResolveAsync(context.CancellationToken);
-                        var api = new DokployApi(apiKeyValue, apiUrlValue, context.Services.GetRequiredService<IHostEnvironment>(), context.Logger, resolvedRegistrySettings);
-                        var resources = context.Model.GetComputeResources();
-
-                        var applications = new List<(IComputeResource Resource, DokployApi.Application Application)>();
-
-                        foreach (var resource in resources)
-                        {
-                            var computeResource = (IComputeResource)resource;
-                            var application = await api.GetOrCreateApplication($"{name}-app-{resource.Name}", $"{name}-project");
-                            applications.Add((computeResource, application));
-                        }
-
-                        var applicationHostsByResource = applications.ToDictionary(
-                            app => app.Resource.Name,
-                            app => string.IsNullOrWhiteSpace(app.Application.AppName) ? app.Application.Name : app.Application.AppName,
-                            StringComparer.OrdinalIgnoreCase);
-
-                        foreach (var app in applications)
-                        {
-                            await api.ConfigureApplicationAsync(app.Application, $"{name}-project", app.Resource, context.ExecutionContext, applicationHostsByResource, context.CancellationToken);
-                        }
-
-                        foreach (var app in applications)
-                        {
-                            await api.DeployApplicationAsync(app.Application, app.Resource);
-                        }
+                        var provisioner = context.Services.GetRequiredService<IDokployEnvironmentProvisioner>();
+                        await provisioner.ProvisionApplicationsAsync(this, context);
                     },
                     DependsOnSteps = [WellKnownPipelineSteps.Push, $"prepare-registry-{name}"],
                     RequiredBySteps = [WellKnownPipelineSteps.Deploy]
@@ -102,11 +54,39 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
 
     private string? ContainerRegistryUrl { get; set; }
 
+    internal DokployRegistryMode? RegistryMode => _registrySettings?.Mode;
+    internal string? RegistryType => _registrySettings?.RegistryType;
+    internal string? ApiUrlParameterName => _apiUrlParameter?.Name;
+    internal string? ApiKeyParameterName => _apiKeyParameter?.Name;
+    internal bool HasRegistryConfiguration => _registrySettings is not null;
+
     public ReferenceExpression Endpoint => ReferenceExpression.Create($"{ContainerRegistryUrl}");
 
     ReferenceExpression IContainerRegistry.Name => ReferenceExpression.Create($"{_name}-registry");
 
-    private async Task<string> ResolveApiUrlAsync(CancellationToken cancellationToken)
+    internal void ConfigureRegistry(DokployRegistrySettings registrySettings)
+    {
+        _registrySettings = registrySettings ?? throw new ArgumentNullException(nameof(registrySettings));
+    }
+
+    internal string GetProjectName() => $"{_name}-project";
+
+    internal void SetContainerRegistryUrl(string? containerRegistryUrl)
+    {
+        ContainerRegistryUrl = containerRegistryUrl;
+    }
+
+    internal async Task<DokployResolvedRegistrySettings> ResolveRegistrySettingsAsync(CancellationToken cancellationToken)
+    {
+        if (_registrySettings is null)
+        {
+            throw new InvalidOperationException($"Dokploy environment '{_name}' does not have a registry configuration. Call WithHostedRegistry(...) or WithSelfHostedRegistry(...).");
+        }
+
+        return await _registrySettings.ResolveAsync(cancellationToken);
+    }
+
+    internal async Task<string> ResolveApiUrlAsync(CancellationToken cancellationToken)
     {
         var apiUrl = _apiUrlParameter is null
             ? null
@@ -120,7 +100,7 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
         return apiUrl;
     }
 
-    private async Task<string> ResolveApiKeyAsync(CancellationToken cancellationToken)
+    internal async Task<string> ResolveApiKeyAsync(CancellationToken cancellationToken)
     {
         var apiKey = _apiKeyParameter is null
             ? null

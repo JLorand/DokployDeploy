@@ -61,57 +61,16 @@ internal static class DokployResponseReaders
 
         using var root = JsonDocument.Parse(content);
         logger?.LogInformation("{MountSource} root kind: {RootKind}", source, root.RootElement.ValueKind);
-        if (root.RootElement.ValueKind == JsonValueKind.Object)
-        {
-            if (TryDeserializeMount(root.RootElement, out var direct))
-            {
-                return [direct!];
-            }
+        var mounts = new List<DokployApi.Mount>();
+        CollectMounts(root.RootElement, mounts);
 
-            var wrapped = JsonSerializer.Deserialize<DokployApi.TrpcEnvelope<List<DokployApi.Mount>>>(content, DokployApi.JsonOptions);
-            var wrappedMounts = wrapped?.Result?.Data?.Json?.Where(m => !string.IsNullOrWhiteSpace(m.MountPath)).ToList();
-            if (wrappedMounts is { Count: > 0 })
-            {
-                return wrappedMounts;
-            }
+        var distinctMounts = mounts
+            .Where(m => !string.IsNullOrWhiteSpace(m.MountPath))
+            .DistinctBy(m => m.Id ?? $"{m.Type}|{m.MountPath}|{m.HostPath}|{m.VolumeName}", StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
-            var wrappedSingle = JsonSerializer.Deserialize<DokployApi.TrpcEnvelope<DokployApi.Mount>>(content, DokployApi.JsonOptions);
-            var single = wrappedSingle?.Result?.Data?.Json;
-            if (single is not null && !string.IsNullOrWhiteSpace(single.MountPath))
-            {
-                return [single];
-            }
-
-            return [];
-        }
-
-        var directList = JsonSerializer.Deserialize<List<DokployApi.Mount>>(content, DokployApi.JsonOptions);
-        if (directList is { Count: > 0 })
-        {
-            return directList.Where(m => !string.IsNullOrWhiteSpace(m.MountPath)).ToList();
-        }
-
-        var wrappedList = JsonSerializer.Deserialize<List<DokployApi.TrpcEnvelope<List<DokployApi.Mount>>>>(content, DokployApi.JsonOptions);
-        if (wrappedList is { Count: > 0 })
-        {
-            var mounts = wrappedList.SelectMany(x => x.Result?.Data?.Json ?? []).Where(m => !string.IsNullOrWhiteSpace(m.MountPath)).ToList();
-            if (mounts.Count > 0)
-            {
-                return mounts;
-            }
-        }
-
-        var wrappedSingleList = JsonSerializer.Deserialize<List<DokployApi.TrpcEnvelope<DokployApi.Mount>>>(content, DokployApi.JsonOptions);
-        if (wrappedSingleList is { Count: > 0 })
-        {
-            var mounts = wrappedSingleList.Select(x => x.Result?.Data?.Json).Where(m => m is not null && !string.IsNullOrWhiteSpace(m.MountPath)).Select(m => m!).ToList();
-            if (mounts.Count > 0)
-            {
-                return mounts;
-            }
-        }
-
-        return [];
+        logger?.LogInformation("{MountSource} parsed {MountCount} mount(s) for reconciliation.", source, distinctMounts.Count);
+        return distinctMounts;
     }
 
     internal static async Task<List<DokployApi.Domain>> ReadDomainsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "domain.byApplicationId")
@@ -460,12 +419,39 @@ internal static class DokployResponseReaders
             return false;
         }
 
-        if (!value.TryGetProperty("mountPath", out _) && !value.TryGetProperty("mountId", out _))
+        if (!value.TryGetProperty("mountPath", out _)
+            && !value.TryGetProperty("mountId", out _)
+            && !value.TryGetProperty("Destination", out _)
+            && !value.TryGetProperty("destination", out _))
         {
             return false;
         }
 
         mount = value.Deserialize<DokployApi.Mount>(DokployApi.JsonOptions);
         return mount is not null && !string.IsNullOrWhiteSpace(mount.MountPath);
+    }
+
+    private static void CollectMounts(JsonElement value, List<DokployApi.Mount> output)
+    {
+        if (TryDeserializeMount(value, out var mount))
+        {
+            output.Add(mount!);
+        }
+
+        if (value.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var property in value.EnumerateObject())
+            {
+                CollectMounts(property.Value, output);
+            }
+        }
+
+        if (value.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in value.EnumerateArray())
+            {
+                CollectMounts(item, output);
+            }
+        }
     }
 }

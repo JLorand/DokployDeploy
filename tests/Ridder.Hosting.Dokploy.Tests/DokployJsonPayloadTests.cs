@@ -98,4 +98,66 @@ public class DokployJsonPayloadTests
 
     Assert.Empty(mounts);
   }
+
+  [Fact]
+  public async Task ReadMountsFromResponseAsync_ReadsNestedMountsFromWrappedPayload()
+  {
+    using var response = new HttpResponseMessage(HttpStatusCode.OK)
+    {
+      Content = new StringContent("""
+        {
+          "result": {
+            "data": {
+              "json": {
+                "mounts": [
+                  {
+                    "mountId": "m-1",
+                    "type": "volume-mount",
+                    "volumeName": "cache-data",
+                    "mountPath": "/data"
+                  }
+                ]
+              }
+            }
+          }
+        }
+        """, Encoding.UTF8, "application/json")
+    };
+
+    var mounts = await DokployResponseReaders.ReadMountsFromResponseAsync(response);
+
+    var mount = Assert.Single(mounts);
+    Assert.Equal("m-1", mount.Id);
+    Assert.Equal("cache-data", mount.VolumeName);
+    Assert.Equal("/data", mount.MountPath);
+  }
+
+  [Fact]
+  public async Task ReadMountsFromResponseAsync_ReadsDockerStyleMountPayload()
+  {
+    using var response = new HttpResponseMessage(HttpStatusCode.OK)
+    {
+      Content = new StringContent("""
+        [
+          {
+            "Type": "volume",
+            "Name": "cache-data",
+            "Source": "/var/lib/docker/volumes/cache-data/_data",
+            "Destination": "/data",
+            "Driver": "local",
+            "Mode": "z",
+            "RW": true,
+            "Propagation": ""
+          }
+        ]
+        """, Encoding.UTF8, "application/json")
+    };
+
+    var mounts = await DokployResponseReaders.ReadMountsFromResponseAsync(response);
+
+    var mount = Assert.Single(mounts);
+    Assert.Equal("volume", mount.Type);
+    Assert.Equal("cache-data", mount.VolumeName);
+    Assert.Equal("/data", mount.MountPath);
+  }
 }
