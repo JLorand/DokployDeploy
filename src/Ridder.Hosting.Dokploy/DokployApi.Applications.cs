@@ -22,8 +22,6 @@ internal partial class DokployApi
             throw new ArgumentException("Project name must be provided.", nameof(projectName));
         }
 
-        using var http = CreateHttpClient();
-
         var project = await GetProjectOrCreateAsync(projectName);
         if (string.IsNullOrWhiteSpace(project.Id))
         {
@@ -105,8 +103,6 @@ internal partial class DokployApi
         IReadOnlyDictionary<string, string> applicationHostsByResource,
         CancellationToken cancellationToken)
     {
-        using var http = CreateHttpClient();
-
         rsc.TryGetDokployPublishAnnotation(out var publishAnnotation);
 
         if (string.IsNullOrWhiteSpace(application.Id))
@@ -147,24 +143,22 @@ internal partial class DokployApi
 
         if (publishAnnotation?.Options.ConfigureEnvironmentVariables ?? true)
         {
-            await SaveApplicationEnvironmentAsync(http, application, projectName, rsc, executionContext, applicationHostsByResource, cancellationToken);
+            await SaveApplicationEnvironmentAsync(application, projectName, rsc, executionContext, applicationHostsByResource, cancellationToken);
         }
 
         if (publishAnnotation?.Options.ConfigureMounts ?? true)
         {
-            await EnsureApplicationMountsAsync(http, application, rsc);
+            await EnsureApplicationMountsAsync(application, rsc);
         }
 
         if (publishAnnotation?.Options.CreateDomainsForExternalEndpoints ?? true)
         {
-            await EnsureApplicationDomainAsync(http, application, rsc);
+            await EnsureApplicationDomainAsync(application, rsc);
         }
     }
 
     internal async Task DeployApplicationAsync(Application application, IComputeResource rsc)
     {
-        using var http = CreateHttpClient();
-
         if (string.IsNullOrWhiteSpace(application.Id))
         {
             throw new InvalidOperationException($"Application '{rsc.Name}' has no applicationId, so deployment cannot be triggered.");
@@ -183,7 +177,6 @@ internal partial class DokployApi
     }
 
     private async Task SaveApplicationEnvironmentAsync(
-        HttpClient http,
         Application application,
         string projectName,
         IComputeResource resource,
@@ -228,7 +221,7 @@ internal partial class DokployApi
         logger.LogInformation("Saved {Count} environment variable(s) for application {AppName}.", environmentVariables.Count, resource.Name);
     }
 
-    private async Task EnsureApplicationMountsAsync(HttpClient http, Application application, IComputeResource resource)
+    private async Task EnsureApplicationMountsAsync(Application application, IComputeResource resource)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
         {
@@ -596,7 +589,7 @@ internal partial class DokployApi
         return $"\"{normalized.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
     }
 
-    private async Task EnsureApplicationDomainAsync(HttpClient http, Application application, IComputeResource resource)
+    private async Task EnsureApplicationDomainAsync(Application application, IComputeResource resource)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
         {

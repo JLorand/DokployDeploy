@@ -13,7 +13,6 @@ internal partial class DokployApi
             throw new ArgumentException("Project id/name must be provided.", nameof(name));
         }
 
-        using var http = CreateHttpClient();
         using var allResponse = await http.GetAsync("api/project.all");
 
         if (allResponse.IsSuccessStatusCode)
