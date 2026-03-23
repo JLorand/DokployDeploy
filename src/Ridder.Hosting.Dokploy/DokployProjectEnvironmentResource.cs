@@ -34,7 +34,7 @@ public class DokployProjectEnvironmentResource : Resource, IContainerRegistry
                         var provisioner = context.Services.GetRequiredService<IDokployEnvironmentProvisioner>();
                         await provisioner.PrepareRegistryAsync(this, context);
                     },
-                    RequiredBySteps = [WellKnownPipelineSteps.Deploy],
+                    RequiredBySteps = [WellKnownPipelineSteps.Push, WellKnownPipelineSteps.Deploy],
                     DependsOnSteps = [WellKnownPipelineSteps.DeployPrereq]
                 },
                 new PipelineStep()
