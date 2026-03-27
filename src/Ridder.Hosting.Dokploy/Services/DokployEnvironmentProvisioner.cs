@@ -4,16 +4,13 @@ using Aspire.Hosting.Publishing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Ridder.Hosting.Dokploy.Abstractions;
+using Ridder.Hosting.Dokploy.Annotations;
+using Ridder.Hosting.Dokploy.Models;
 
-namespace Ridder.Hosting.Dokploy;
+namespace Ridder.Hosting.Dokploy.Services;
 
 #pragma warning disable ASPIREPIPELINES001
-internal interface IDokployEnvironmentProvisioner
-{
-    Task PrepareRegistryAsync(DokployProjectEnvironmentResource resource, PipelineStepContext context);
-    Task ProvisionApplicationsAsync(DokployProjectEnvironmentResource resource, PipelineStepContext context);
-}
-
 internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisioner
 {
     public async Task PrepareRegistryAsync(DokployProjectEnvironmentResource resource, PipelineStepContext context)
@@ -33,18 +30,21 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
             resource.Name,
             maskedApiKey);
 
-        using var api = new DokployApi(
+        using var client = new DokployApiClient(
             apiKeyValue,
             apiUrlValue,
             context.Services.GetRequiredService<IHostEnvironment>(),
             context.Logger,
             resolvedRegistrySettings);
 
+        var projectService = new DokployProjectService(client);
+        var registryService = new DokployRegistryService(client);
+
         var projectName = resource.GetProjectName();
-        var project = await api.GetProjectOrCreateAsync(projectName);
+        var project = await projectService.GetProjectOrCreateAsync(projectName);
         context.Logger.LogInformation("Project {ProjectName} exists.", project.Name);
 
-        var registry = await api.GetOrCreateRegistryAsync(project);
+        var registry = await registryService.GetOrCreateRegistryAsync(project);
         resource.ReplaceDokployRegistryAccessAnnotation(new DokployRegistryAccessAnnotation(
             string.IsNullOrWhiteSpace(registry.PushPrefix) ? registry.RegistryUrl : registry.PushPrefix));
         context.Logger.LogInformation("Registry for project {ProjectName} is ready.", project.Name);
@@ -74,12 +74,15 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
         var apiKeyValue = await resource.ResolveApiKeyAsync(context.CancellationToken);
         var apiUrlValue = await resource.ResolveApiUrlAsync(context.CancellationToken);
         var resolvedRegistrySettings = await resource.ResolveRegistrySettingsAsync(context.CancellationToken);
-        using var api = new DokployApi(
+        using var client = new DokployApiClient(
             apiKeyValue,
             apiUrlValue,
             context.Services.GetRequiredService<IHostEnvironment>(),
             context.Logger,
             resolvedRegistrySettings);
+
+        var projectService = new DokployProjectService(client);
+        var applicationService = new DokployApplicationService(client, projectService);
 
         var resources = context.Model.GetComputeResources().OfType<IComputeResource>().GetDokployComputeResources(resource);
         if (resources.Count == 0)
@@ -88,7 +91,7 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
             return;
         }
 
-        var applications = new List<(IComputeResource Resource, DokployApi.Application Application)>();
+        var applications = new List<(IComputeResource Resource, DokployApplication Application)>();
         var projectName = resource.GetProjectName();
 
         foreach (var computeResource in resources)
@@ -97,7 +100,7 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
                 ? annotation!.ResolveApplicationName(computeResource.Name)
                 : $"{resource.Name}-app-{computeResource.Name}";
 
-            var application = await api.GetOrCreateApplication(applicationName, projectName);
+            var application = await applicationService.GetOrCreateApplication(applicationName, projectName);
             applications.Add((computeResource, application));
         }
 
@@ -108,12 +111,12 @@ internal sealed class DokployEnvironmentProvisioner : IDokployEnvironmentProvisi
 
         foreach (var app in applications)
         {
-            await api.ConfigureApplicationAsync(app.Application, projectName, app.Resource, context.ExecutionContext, applicationHostsByResource, context.CancellationToken);
+            await applicationService.ConfigureApplicationAsync(app.Application, projectName, app.Resource, context.ExecutionContext, applicationHostsByResource, context.CancellationToken);
         }
 
         foreach (var app in applications)
         {
-            await api.DeployApplicationAsync(app.Application, app.Resource);
+            await applicationService.DeployApplicationAsync(app.Application, app.Resource);
         }
     }
 }

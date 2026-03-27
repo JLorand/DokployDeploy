@@ -1,13 +1,21 @@
-using System.Text;
-using System.Text.RegularExpressions;
 using Microsoft.Extensions.Logging;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Utilities;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
-namespace Ridder.Hosting.Dokploy;
+namespace Ridder.Hosting.Dokploy.Services;
 
-internal partial class DokployApi
+internal sealed class DokployRegistryService
 {
-    internal async Task<Registry> GetOrCreateRegistryAsync(Project proj)
+    private readonly DokployApiClient _client;
+
+    internal DokployRegistryService(DokployApiClient client)
+    {
+        _client = client;
+    }
+
+    internal async Task<DokployRegistry> GetOrCreateRegistryAsync(DokployProject proj)
     {
         ArgumentNullException.ThrowIfNull(proj);
         if (string.IsNullOrWhiteSpace(proj.Id))
@@ -15,7 +23,7 @@ internal partial class DokployApi
             throw new InvalidOperationException($"Project '{proj.Name}' has no id. Cannot create registry compose resource without project id.");
         }
 
-        using var projectResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(proj.Id)}");
+        using var projectResponse = await _client.Http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(proj.Id)}");
         projectResponse.EnsureSuccessStatusCode();
 
         var refreshedProject = await DokployResponseReaders.ReadProjectFromResponseAsync(projectResponse)
@@ -30,21 +38,21 @@ internal partial class DokployApi
             throw new InvalidOperationException($"Project '{refreshedProject.Name}' has no usable environment (expected one named 'production').");
         }
 
-        if (registrySettings.Mode == DokployRegistryMode.Hosted)
+        if (_client.RegistrySettings.Mode == DokployRegistryMode.Hosted)
         {
             var hostedRegistryName = $"{refreshedProject.Name}-registry";
             var linkedHostedRegistry = await EnsureRegistryLinkedAsync(hostedRegistryName);
             var hostedRegistryUrl = NormalizeRegistryHost(linkedHostedRegistry?.RegistryUrl ?? GetRegistryUrl());
-            var hostedPushPrefix = ResolveHostedPushPrefix(hostedRegistryUrl, linkedHostedRegistry?.Username ?? registrySettings.Username, linkedHostedRegistry?.ImagePrefix);
-            return new Registry
+            var hostedPushPrefix = ResolveHostedPushPrefix(hostedRegistryUrl, linkedHostedRegistry?.Username ?? _client.RegistrySettings.Username, linkedHostedRegistry?.ImagePrefix);
+            return new DokployRegistry
             {
                 RegistryId = linkedHostedRegistry?.RegistryId,
                 RegistryUrl = hostedRegistryUrl,
                 ProjectId = refreshedProject.Id,
                 EnvironmentId = targetEnvironment.Id,
                 Name = linkedHostedRegistry?.RegistryName ?? hostedRegistryName,
-                Username = linkedHostedRegistry?.Username ?? registrySettings.Username,
-                Password = linkedHostedRegistry?.Password ?? registrySettings.Password,
+                Username = linkedHostedRegistry?.Username ?? _client.RegistrySettings.Username,
+                Password = linkedHostedRegistry?.Password ?? _client.RegistrySettings.Password,
                 PushPrefix = hostedPushPrefix
             };
         }
@@ -60,8 +68,8 @@ internal partial class DokployApi
             var linkedRegistry = await EnsureRegistryLinkedAsync(existingRegistryDetails.Name);
             var access = ResolveSelfHostedRegistryAccess(existingRegistryDetails, linkedRegistry);
 
-            logger.LogInformation("Registry compose already exists for project {ProjectName} in environment {EnvironmentName}.", refreshedProject.Name, targetEnvironment.Name);
-            return new Registry
+            _client.Logger.LogInformation("Registry compose already exists for project {ProjectName} in environment {EnvironmentName}.", refreshedProject.Name, targetEnvironment.Name);
+            return new DokployRegistry
             {
                 RegistryId = linkedRegistry?.RegistryId,
                 RegistryUrl = access.RegistryUrl,
@@ -79,18 +87,18 @@ internal partial class DokployApi
         {
             environmentId = targetEnvironment.Id,
             id = "registry"
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        using var deployResponse = await http.PostAsync("api/compose.deployTemplate", CreateJsonContent(deployBody));
+        using var deployResponse = await _client.Http.PostAsync("api/compose.deployTemplate", DokployApiClient.CreateJsonContent(deployBody));
         deployResponse.EnsureSuccessStatusCode();
 
         var deployedCompose = await DokployResponseReaders.ReadComposeFromResponseAsync(deployResponse);
         if (deployedCompose is not null)
         {
-            logger.LogInformation("Registry compose deployment accepted for project {ProjectName}. Verifying via project.one.", refreshedProject.Name);
+            _client.Logger.LogInformation("Registry compose deployment accepted for project {ProjectName}. Verifying via project.one.", refreshedProject.Name);
         }
 
-        using var verifyResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(proj.Id)}");
+        using var verifyResponse = await _client.Http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(proj.Id)}");
         verifyResponse.EnsureSuccessStatusCode();
 
         var verifiedProject = await DokployResponseReaders.ReadProjectFromResponseAsync(verifyResponse)
@@ -113,7 +121,7 @@ internal partial class DokployApi
         var linkedVerifiedRegistry = await EnsureRegistryLinkedAsync(verifiedRegistryDetails.Name);
         var verifiedAccess = ResolveSelfHostedRegistryAccess(verifiedRegistryDetails, linkedVerifiedRegistry);
 
-        return new Registry
+        return new DokployRegistry
         {
             RegistryId = linkedVerifiedRegistry?.RegistryId,
             RegistryUrl = verifiedAccess.RegistryUrl,
@@ -127,7 +135,7 @@ internal partial class DokployApi
         };
     }
 
-    private RegistryAccess ResolveSelfHostedRegistryAccess(Compose compose, RemoteRegistry? linkedRegistry)
+    private RegistryAccess ResolveSelfHostedRegistryAccess(DokployCompose compose, DokployRemoteRegistry? linkedRegistry)
     {
         var registryUrl = linkedRegistry?.RegistryUrl ?? GetRegistryUrl();
         var username = ResolveRegistryUsername(compose, linkedRegistry);
@@ -136,7 +144,7 @@ internal partial class DokployApi
         return new RegistryAccess(registryUrl, username, password);
     }
 
-    private async Task EnsureRegistryComposeDomainAsync(Compose compose)
+    private async Task EnsureRegistryComposeDomainAsync(DokployCompose compose)
     {
         if (string.IsNullOrWhiteSpace(compose.Id))
         {
@@ -144,10 +152,10 @@ internal partial class DokployApi
         }
 
         var registryHost = GetRegistryUrl();
-        using var byComposeResponse = await http.GetAsync($"api/domain.byComposeId?composeId={Uri.EscapeDataString(compose.Id)}");
+        using var byComposeResponse = await _client.Http.GetAsync($"api/domain.byComposeId?composeId={Uri.EscapeDataString(compose.Id)}");
         byComposeResponse.EnsureSuccessStatusCode();
 
-        var existingDomains = await DokployResponseReaders.ReadDomainsFromResponseAsync(byComposeResponse, logger, "domain.byComposeId");
+        var existingDomains = await DokployResponseReaders.ReadDomainsFromResponseAsync(byComposeResponse, _client.Logger, "domain.byComposeId");
         var existingDomain = existingDomains.FirstOrDefault(d => string.Equals(d.Host, registryHost, StringComparison.OrdinalIgnoreCase));
         if (existingDomain is not null)
         {
@@ -165,11 +173,11 @@ internal partial class DokployApi
                 certificateType = "letsencrypt",
                 serviceName = "registry",
                 domainType = "compose"
-            }, JsonOptions);
+            }, DokployApiClient.JsonOptions);
 
-            using var updateResponse = await http.PostAsync("api/domain.update", CreateJsonContent(updateBody));
+            using var updateResponse = await _client.Http.PostAsync("api/domain.update", DokployApiClient.CreateJsonContent(updateBody));
             updateResponse.EnsureSuccessStatusCode();
-            logger.LogInformation("Updated compose domain {DomainHost} for registry compose {ComposeName}.", registryHost, compose.Name);
+            _client.Logger.LogInformation("Updated compose domain {DomainHost} for registry compose {ComposeName}.", registryHost, compose.Name);
             return;
         }
 
@@ -182,21 +190,21 @@ internal partial class DokployApi
             certificateType = "letsencrypt",
             serviceName = "registry",
             domainType = "compose"
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        using var createResponse = await http.PostAsync("api/domain.create", CreateJsonContent(createBody));
+        using var createResponse = await _client.Http.PostAsync("api/domain.create", DokployApiClient.CreateJsonContent(createBody));
         createResponse.EnsureSuccessStatusCode();
-        logger.LogInformation("Created compose domain {DomainHost} for registry compose {ComposeName}.", registryHost, compose.Name);
+        _client.Logger.LogInformation("Created compose domain {DomainHost} for registry compose {ComposeName}.", registryHost, compose.Name);
     }
 
-    private async Task<Compose> GetComposeDetailsAsync(Compose compose)
+    private async Task<DokployCompose> GetComposeDetailsAsync(DokployCompose compose)
     {
         if (string.IsNullOrWhiteSpace(compose.Id))
         {
             throw new InvalidOperationException($"Compose '{compose.Name}' does not have composeId, so compose.one cannot be called.");
         }
 
-        using var composeResponse = await http.GetAsync($"api/compose.one?composeId={Uri.EscapeDataString(compose.Id)}");
+        using var composeResponse = await _client.Http.GetAsync($"api/compose.one?composeId={Uri.EscapeDataString(compose.Id)}");
         composeResponse.EnsureSuccessStatusCode();
 
         var fullCompose = await DokployResponseReaders.ReadComposeFromResponseAsync(composeResponse)
@@ -205,7 +213,7 @@ internal partial class DokployApi
         return fullCompose;
     }
 
-    private async Task DeployComposeAsync(Compose compose)
+    private async Task DeployComposeAsync(DokployCompose compose)
     {
         if (string.IsNullOrWhiteSpace(compose.Id))
         {
@@ -217,18 +225,18 @@ internal partial class DokployApi
             composeId = compose.Id,
             title = $"Aspire deploy for {compose.Name}",
             description = "Started automatically before registry link verification."
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        using var deployResponse = await http.PostAsync("api/compose.deploy", CreateJsonContent(deployBody));
-        logger.LogInformation("Compose deploy response for {ComposeName}: {StatusCode} - {ReasonPhrase}", compose.Name, deployResponse.StatusCode, deployResponse.ReasonPhrase);
+        using var deployResponse = await _client.Http.PostAsync("api/compose.deploy", DokployApiClient.CreateJsonContent(deployBody));
+        _client.Logger.LogInformation("Compose deploy response for {ComposeName}: {StatusCode} - {ReasonPhrase}", compose.Name, deployResponse.StatusCode, deployResponse.ReasonPhrase);
         deployResponse.EnsureSuccessStatusCode();
     }
 
-    private async Task<RemoteRegistry?> EnsureRegistryLinkedAsync(string registryName)
+    private async Task<DokployRemoteRegistry?> EnsureRegistryLinkedAsync(string registryName)
     {
         var registryUrl = NormalizeRegistryHost(GetRegistryUrl());
-        var username = registrySettings.Username;
-        var password = registrySettings.Password;
+        var username = _client.RegistrySettings.Username;
+        var password = _client.RegistrySettings.Password;
         var imagePrefix = ResolveHostedPushPrefix(registryUrl, username, imagePrefix: null);
 
         var testInput = new RegistryRequestPayload
@@ -237,20 +245,20 @@ internal partial class DokployApi
             Username = username,
             Password = password,
             RegistryUrl = registryUrl,
-            RegistryType = registrySettings.RegistryType
+            RegistryType = _client.RegistrySettings.RegistryType
         };
 
         var existingRegistry = await FindExistingRegistryAsync(testInput);
         if (existingRegistry is not null)
         {
-            logger.LogInformation("Registry URL {RegistryUrl} already exists as registryId {RegistryId}.", registryUrl, existingRegistry.RegistryId);
+            _client.Logger.LogInformation("Registry URL {RegistryUrl} already exists as registryId {RegistryId}.", registryUrl, existingRegistry.RegistryId);
             return existingRegistry;
         }
 
         var works = await TestRegistryLinkedAsync(testInput);
         if (!works)
         {
-            logger.LogInformation("Registry URL {RegistryUrl} is not yet valid in Dokploy. Will attempt creation.", registryUrl);
+            _client.Logger.LogInformation("Registry URL {RegistryUrl} is not yet valid in Dokploy. Will attempt creation.", registryUrl);
         }
 
         var createBody = JsonSerializer.Serialize(new
@@ -259,14 +267,14 @@ internal partial class DokployApi
             username,
             password,
             registryUrl,
-            registryType = registrySettings.RegistryType,
+            registryType = _client.RegistrySettings.RegistryType,
             imagePrefix
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        using var createResponse = await http.PostAsync("api/registry.create", CreateJsonContent(createBody));
-        logger.LogInformation("Create registry response: {StatusCode} - {ReasonPhrase}", createResponse.StatusCode, createResponse.ReasonPhrase);
+        using var createResponse = await _client.Http.PostAsync("api/registry.create", DokployApiClient.CreateJsonContent(createBody));
+        _client.Logger.LogInformation("Create registry response: {StatusCode} - {ReasonPhrase}", createResponse.StatusCode, createResponse.ReasonPhrase);
         createResponse.EnsureSuccessStatusCode();
-        logger.LogInformation("Created Dokploy registry entry for {RegistryUrl}.", registryUrl);
+        _client.Logger.LogInformation("Created Dokploy registry entry for {RegistryUrl}.", registryUrl);
 
         var createdRegistry = await DokployResponseReaders.ReadRegistryFromResponseAsync(createResponse);
         if (createdRegistry is not null)
@@ -277,9 +285,9 @@ internal partial class DokployApi
         return await FindExistingRegistryAsync(testInput);
     }
 
-    private async Task<RemoteRegistry?> FindExistingRegistryAsync(RegistryRequestPayload payload)
+    private async Task<DokployRemoteRegistry?> FindExistingRegistryAsync(RegistryRequestPayload payload)
     {
-        using var allResponse = await http.GetAsync("api/registry.all");
+        using var allResponse = await _client.Http.GetAsync("api/registry.all");
         allResponse.EnsureSuccessStatusCode();
 
         var registries = await DokployResponseReaders.ReadRegistriesFromResponseAsync(allResponse);
@@ -297,16 +305,16 @@ internal partial class DokployApi
             password = payload.Password,
             registryUrl = payload.RegistryUrl,
             registryType = payload.RegistryType
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        logger.LogInformation(
+        _client.Logger.LogInformation(
             "Testing Dokploy registry link for {RegistryName} at {RegistryUrl} with username {Username}.",
             payload.RegistryName,
             payload.RegistryUrl,
             payload.Username);
-        using var testResponse = await http.PostAsync("api/registry.testRegistry", CreateJsonContent(testBody));
+        using var testResponse = await _client.Http.PostAsync("api/registry.testRegistry", DokployApiClient.CreateJsonContent(testBody));
         var responseContent = await testResponse.Content.ReadAsStringAsync();
-        logger.LogInformation("Test registry response: {StatusCode} - {ReasonPhrase}", testResponse.StatusCode, responseContent);
+        _client.Logger.LogInformation("Test registry response: {StatusCode} - {ReasonPhrase}", testResponse.StatusCode, responseContent);
 
         if (!testResponse.IsSuccessStatusCode)
         {
@@ -324,7 +332,7 @@ internal partial class DokployApi
 
     private string GetRegistryUrl()
     {
-        return registrySettings.RegistryUrl;
+        return _client.RegistrySettings.RegistryUrl;
     }
 
     internal static string ResolveHostedPushPrefix(string registryUrl, string username, string? imagePrefix)
@@ -392,7 +400,7 @@ internal partial class DokployApi
             || string.Equals(registryUrl, "registry-1.docker.io", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string ResolveRegistryUsername(Compose compose, RemoteRegistry? linkedRegistry)
+    private static string ResolveRegistryUsername(DokployCompose compose, DokployRemoteRegistry? linkedRegistry)
     {
         if (!string.IsNullOrWhiteSpace(linkedRegistry?.Username))
         {
@@ -408,7 +416,7 @@ internal partial class DokployApi
         return GetRegistryUsernameFromCompose(compose);
     }
 
-    private static string ResolveRegistryPassword(Compose compose, RemoteRegistry? linkedRegistry)
+    private static string ResolveRegistryPassword(DokployCompose compose, DokployRemoteRegistry? linkedRegistry)
     {
         if (!string.IsNullOrWhiteSpace(linkedRegistry?.Password))
         {
@@ -418,7 +426,7 @@ internal partial class DokployApi
         return GetRegistryPasswordFromCompose(compose);
     }
 
-    internal static string GetRegistryUsernameFromCompose(Compose compose)
+    internal static string GetRegistryUsernameFromCompose(DokployCompose compose)
     {
         var envUsername = TryGetEnvValue(compose.Env, "REGISTRY_USERNAME", "REGISTRY_USER", "USERNAME", "REGISTRY_HTPASSWD_USERNAME");
         if (!string.IsNullOrWhiteSpace(envUsername))
@@ -453,7 +461,7 @@ internal partial class DokployApi
         throw new InvalidOperationException($"Could not extract registry username from compose file for compose '{compose.Name}'.");
     }
 
-    internal static string GetRegistryPasswordFromCompose(Compose compose)
+    internal static string GetRegistryPasswordFromCompose(DokployCompose compose)
     {
         var envPassword = TryGetEnvValue(compose.Env, "REGISTRY_PASSWORD", "PASSWORD", "REGISTRY_HTPASSWD_PASSWORD");
         if (!string.IsNullOrWhiteSpace(envPassword))

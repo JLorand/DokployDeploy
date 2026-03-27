@@ -1,6 +1,6 @@
 using System.Text.Json;
 
-namespace Ridder.Hosting.Dokploy;
+namespace Ridder.Hosting.Dokploy.Utilities;
 
 internal static class DokployJsonPayload
 {

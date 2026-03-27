@@ -1,55 +1,57 @@
 using Microsoft.Extensions.Logging;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Utilities;
 using System.Text.Json;
 
-namespace Ridder.Hosting.Dokploy;
+namespace Ridder.Hosting.Dokploy.Services;
 
 internal static class DokployResponseReaders
 {
-    internal static async Task<DokployApi.Project?> ReadProjectFromResponseAsync(HttpResponseMessage response)
+    internal static async Task<DokployProject?> ReadProjectFromResponseAsync(HttpResponseMessage response)
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var json = await JsonDocument.ParseAsync(stream);
         return TryExtractProject(json.RootElement);
     }
 
-    internal static async Task<DokployApi.Project?> FindProjectByNameFromResponseAsync(HttpResponseMessage response, string expectedName)
+    internal static async Task<DokployProject?> FindProjectByNameFromResponseAsync(HttpResponseMessage response, string expectedName)
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var json = await JsonDocument.ParseAsync(stream);
         return FindProjectByName(json.RootElement, expectedName);
     }
 
-    internal static async Task<DokployApi.Compose?> ReadComposeFromResponseAsync(HttpResponseMessage response)
+    internal static async Task<DokployCompose?> ReadComposeFromResponseAsync(HttpResponseMessage response)
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var json = await JsonDocument.ParseAsync(stream);
         return TryExtractCompose(json.RootElement);
     }
 
-    internal static async Task<List<DokployApi.RemoteRegistry>> ReadRegistriesFromResponseAsync(HttpResponseMessage response)
+    internal static async Task<List<DokployRemoteRegistry>> ReadRegistriesFromResponseAsync(HttpResponseMessage response)
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var json = await JsonDocument.ParseAsync(stream);
-        var output = new List<DokployApi.RemoteRegistry>();
+        var output = new List<DokployRemoteRegistry>();
         CollectRegistries(json.RootElement, output);
         return output;
     }
 
-    internal static async Task<DokployApi.RemoteRegistry?> ReadRegistryFromResponseAsync(HttpResponseMessage response)
+    internal static async Task<DokployRemoteRegistry?> ReadRegistryFromResponseAsync(HttpResponseMessage response)
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var json = await JsonDocument.ParseAsync(stream);
         return TryExtractRegistry(json.RootElement);
     }
 
-    internal static async Task<DokployApi.Application?> ReadApplicationFromResponseAsync(HttpResponseMessage response)
+    internal static async Task<DokployApplication?> ReadApplicationFromResponseAsync(HttpResponseMessage response)
     {
         await using var stream = await response.Content.ReadAsStreamAsync();
         using var json = await JsonDocument.ParseAsync(stream);
         return TryExtractApplication(json.RootElement);
     }
 
-    internal static async Task<List<DokployApi.Mount>> ReadMountsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "mounts.allNamedByApplicationId")
+    internal static async Task<List<DokployMount>> ReadMountsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "mounts.allNamedByApplicationId")
     {
         var content = DokployJsonPayload.Normalize(await response.Content.ReadAsStringAsync());
         logger?.LogInformation("{MountSource} payload: {Payload}", source, DokployJsonPayload.GetPayloadSnippet(content));
@@ -61,7 +63,7 @@ internal static class DokployResponseReaders
 
         using var root = JsonDocument.Parse(content);
         logger?.LogInformation("{MountSource} root kind: {RootKind}", source, root.RootElement.ValueKind);
-        var mounts = new List<DokployApi.Mount>();
+        var mounts = new List<DokployMount>();
         CollectMounts(root.RootElement, mounts);
 
         var distinctMounts = mounts
@@ -73,7 +75,7 @@ internal static class DokployResponseReaders
         return distinctMounts;
     }
 
-    internal static async Task<List<DokployApi.Domain>> ReadDomainsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "domain.byApplicationId")
+    internal static async Task<List<DokployDomain>> ReadDomainsFromResponseAsync(HttpResponseMessage response, ILogger? logger = null, string source = "domain.byApplicationId")
     {
         var content = DokployJsonPayload.Normalize(await response.Content.ReadAsStringAsync());
         logger?.LogInformation("{DomainSource} payload: {Payload}", source, DokployJsonPayload.GetPayloadSnippet(content));
@@ -87,20 +89,20 @@ internal static class DokployResponseReaders
         logger?.LogInformation("{DomainSource} root kind: {RootKind}", source, root.RootElement.ValueKind);
         if (root.RootElement.ValueKind == JsonValueKind.Object)
         {
-            var direct = JsonSerializer.Deserialize<DokployApi.Domain>(content, DokployApi.JsonOptions);
+            var direct = JsonSerializer.Deserialize<DokployDomain>(content, DokployApiClient.JsonOptions);
             if (direct is not null && !string.IsNullOrWhiteSpace(direct.Host))
             {
                 return [direct];
             }
 
-            var wrapped = JsonSerializer.Deserialize<DokployApi.TrpcEnvelope<List<DokployApi.Domain>>>(content, DokployApi.JsonOptions);
+            var wrapped = JsonSerializer.Deserialize<TrpcEnvelope<List<DokployDomain>>>(content, DokployApiClient.JsonOptions);
             var wrappedDomains = wrapped?.Result?.Data?.Json?.Where(d => !string.IsNullOrWhiteSpace(d.Host)).ToList();
             if (wrappedDomains is { Count: > 0 })
             {
                 return wrappedDomains;
             }
 
-            var wrappedSingle = JsonSerializer.Deserialize<DokployApi.TrpcEnvelope<DokployApi.Domain>>(content, DokployApi.JsonOptions);
+            var wrappedSingle = JsonSerializer.Deserialize<TrpcEnvelope<DokployDomain>>(content, DokployApiClient.JsonOptions);
             var single = wrappedSingle?.Result?.Data?.Json;
             if (single is not null && !string.IsNullOrWhiteSpace(single.Host))
             {
@@ -110,13 +112,13 @@ internal static class DokployResponseReaders
             return [];
         }
 
-        var directList = JsonSerializer.Deserialize<List<DokployApi.Domain>>(content, DokployApi.JsonOptions);
+        var directList = JsonSerializer.Deserialize<List<DokployDomain>>(content, DokployApiClient.JsonOptions);
         if (directList is { Count: > 0 })
         {
             return directList.Where(d => !string.IsNullOrWhiteSpace(d.Host)).ToList();
         }
 
-        var wrappedList = JsonSerializer.Deserialize<List<DokployApi.TrpcEnvelope<List<DokployApi.Domain>>>>(content, DokployApi.JsonOptions);
+        var wrappedList = JsonSerializer.Deserialize<List<TrpcEnvelope<List<DokployDomain>>>>(content, DokployApiClient.JsonOptions);
         if (wrappedList is { Count: > 0 })
         {
             var domains = wrappedList.SelectMany(x => x.Result?.Data?.Json ?? []).Where(d => !string.IsNullOrWhiteSpace(d.Host)).ToList();
@@ -126,7 +128,7 @@ internal static class DokployResponseReaders
             }
         }
 
-        var wrappedSingleList = JsonSerializer.Deserialize<List<DokployApi.TrpcEnvelope<DokployApi.Domain>>>(content, DokployApi.JsonOptions);
+        var wrappedSingleList = JsonSerializer.Deserialize<List<TrpcEnvelope<DokployDomain>>>(content, DokployApiClient.JsonOptions);
         if (wrappedSingleList is { Count: > 0 })
         {
             var domains = wrappedSingleList.Select(x => x.Result?.Data?.Json).Where(d => d is not null && !string.IsNullOrWhiteSpace(d.Host)).Select(d => d!).ToList();
@@ -161,7 +163,7 @@ internal static class DokployResponseReaders
             string? fromWrappedString = null;
             try
             {
-                var wrappedString = JsonSerializer.Deserialize<DokployApi.TrpcEnvelope<string>>(content, DokployApi.JsonOptions);
+                var wrappedString = JsonSerializer.Deserialize<TrpcEnvelope<string>>(content, DokployApiClient.JsonOptions);
                 fromWrappedString = wrappedString?.Result?.Data?.Json;
             }
             catch (JsonException)
@@ -173,7 +175,7 @@ internal static class DokployResponseReaders
                 return fromWrappedString;
             }
 
-            var wrappedData = JsonSerializer.Deserialize<DokployApi.TrpcEnvelope<DokployApi.GeneratedDomainData>>(content, DokployApi.JsonOptions);
+            var wrappedData = JsonSerializer.Deserialize<TrpcEnvelope<GeneratedDomainData>>(content, DokployApiClient.JsonOptions);
             var fromWrappedData = wrappedData?.Result?.Data?.Json;
             if (fromWrappedData is not null)
             {
@@ -184,14 +186,14 @@ internal static class DokployResponseReaders
                 }
             }
 
-            var directData = JsonSerializer.Deserialize<DokployApi.GeneratedDomainData>(content, DokployApi.JsonOptions);
+            var directData = JsonSerializer.Deserialize<GeneratedDomainData>(content, DokployApiClient.JsonOptions);
             return directData?.Json ?? directData?.Host ?? directData?.Domain;
         }
 
         return null;
     }
 
-    private static DokployApi.Project? TryExtractProject(JsonElement root)
+    private static DokployProject? TryExtractProject(JsonElement root)
     {
         if (TryDeserializeProject(root, out var directProject))
         {
@@ -212,7 +214,7 @@ internal static class DokployResponseReaders
         return null;
     }
 
-    private static bool TryDeserializeProject(JsonElement value, out DokployApi.Project? project)
+    private static bool TryDeserializeProject(JsonElement value, out DokployProject? project)
     {
         project = null;
         if (value.ValueKind != JsonValueKind.Object)
@@ -225,11 +227,11 @@ internal static class DokployResponseReaders
             return false;
         }
 
-        project = value.Deserialize<DokployApi.Project>(DokployApi.JsonOptions);
+        project = value.Deserialize<DokployProject>(DokployApiClient.JsonOptions);
         return project is not null;
     }
 
-    private static DokployApi.Project? FindProjectByName(JsonElement value, string expectedName)
+    private static DokployProject? FindProjectByName(JsonElement value, string expectedName)
     {
         if (TryDeserializeProject(value, out var candidate) && string.Equals(candidate?.Name, expectedName, StringComparison.OrdinalIgnoreCase))
         {
@@ -263,7 +265,7 @@ internal static class DokployResponseReaders
         return null;
     }
 
-    private static DokployApi.Compose? TryExtractCompose(JsonElement root)
+    private static DokployCompose? TryExtractCompose(JsonElement root)
     {
         if (TryDeserializeCompose(root, out var directCompose))
         {
@@ -284,7 +286,7 @@ internal static class DokployResponseReaders
         return null;
     }
 
-    private static bool TryDeserializeCompose(JsonElement value, out DokployApi.Compose? compose)
+    private static bool TryDeserializeCompose(JsonElement value, out DokployCompose? compose)
     {
         compose = null;
         if (value.ValueKind != JsonValueKind.Object)
@@ -297,11 +299,11 @@ internal static class DokployResponseReaders
             return false;
         }
 
-        compose = value.Deserialize<DokployApi.Compose>(DokployApi.JsonOptions);
+        compose = value.Deserialize<DokployCompose>(DokployApiClient.JsonOptions);
         return compose is not null;
     }
 
-    private static DokployApi.RemoteRegistry? TryExtractRegistry(JsonElement element)
+    private static DokployRemoteRegistry? TryExtractRegistry(JsonElement element)
     {
         if (TryDeserializeRegistry(element, out var registry))
         {
@@ -326,7 +328,7 @@ internal static class DokployResponseReaders
         return null;
     }
 
-    private static void CollectRegistries(JsonElement element, List<DokployApi.RemoteRegistry> output)
+    private static void CollectRegistries(JsonElement element, List<DokployRemoteRegistry> output)
     {
         if (TryDeserializeRegistry(element, out var registry))
         {
@@ -350,9 +352,9 @@ internal static class DokployResponseReaders
         }
     }
 
-    private static bool TryDeserializeRegistry(JsonElement value, out DokployApi.RemoteRegistry registry)
+    private static bool TryDeserializeRegistry(JsonElement value, out DokployRemoteRegistry registry)
     {
-        registry = new DokployApi.RemoteRegistry();
+        registry = new DokployRemoteRegistry();
         if (value.ValueKind != JsonValueKind.Object)
         {
             return false;
@@ -363,7 +365,7 @@ internal static class DokployResponseReaders
             return false;
         }
 
-        var candidate = value.Deserialize<DokployApi.RemoteRegistry>(DokployApi.JsonOptions);
+        var candidate = value.Deserialize<DokployRemoteRegistry>(DokployApiClient.JsonOptions);
         if (candidate is null)
         {
             return false;
@@ -373,7 +375,7 @@ internal static class DokployResponseReaders
         return true;
     }
 
-    private static DokployApi.Application? TryExtractApplication(JsonElement root)
+    private static DokployApplication? TryExtractApplication(JsonElement root)
     {
         if (TryDeserializeApplication(root, out var directApp))
         {
@@ -394,7 +396,7 @@ internal static class DokployResponseReaders
         return null;
     }
 
-    private static bool TryDeserializeApplication(JsonElement value, out DokployApi.Application? application)
+    private static bool TryDeserializeApplication(JsonElement value, out DokployApplication? application)
     {
         application = null;
         if (value.ValueKind != JsonValueKind.Object)
@@ -407,11 +409,11 @@ internal static class DokployResponseReaders
             return false;
         }
 
-        application = value.Deserialize<DokployApi.Application>(DokployApi.JsonOptions);
+        application = value.Deserialize<DokployApplication>(DokployApiClient.JsonOptions);
         return application is not null;
     }
 
-    private static bool TryDeserializeMount(JsonElement value, out DokployApi.Mount? mount)
+    private static bool TryDeserializeMount(JsonElement value, out DokployMount? mount)
     {
         mount = null;
         if (value.ValueKind != JsonValueKind.Object)
@@ -427,11 +429,11 @@ internal static class DokployResponseReaders
             return false;
         }
 
-        mount = value.Deserialize<DokployApi.Mount>(DokployApi.JsonOptions);
+        mount = value.Deserialize<DokployMount>(DokployApiClient.JsonOptions);
         return mount is not null && !string.IsNullOrWhiteSpace(mount.MountPath);
     }
 
-    private static void CollectMounts(JsonElement value, List<DokployApi.Mount> output)
+    private static void CollectMounts(JsonElement value, List<DokployMount> output)
     {
         if (TryDeserializeMount(value, out var mount))
         {

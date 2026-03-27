@@ -1,4 +1,6 @@
 using Aspire.Hosting.ApplicationModel;
+using Ridder.Hosting.Dokploy.Abstractions;
+using Ridder.Hosting.Dokploy.Annotations;
 
 namespace Ridder.Hosting.Dokploy;
 

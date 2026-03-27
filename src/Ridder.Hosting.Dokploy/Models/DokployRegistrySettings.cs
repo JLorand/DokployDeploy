@@ -1,6 +1,4 @@
-using Aspire.Hosting.ApplicationModel;
-
-namespace Ridder.Hosting.Dokploy;
+namespace Ridder.Hosting.Dokploy.Models;
 
 internal enum DokployRegistryMode
 {

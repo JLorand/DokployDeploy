@@ -1,4 +1,6 @@
-using Ridder.Hosting.Dokploy;
+using Ridder.Hosting.Dokploy.Annotations;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Services;
 
 namespace Ridder.Hosting.Dokploy.Tests;
 
@@ -55,7 +57,7 @@ public class DokployRegistrySettingsTests
     [Fact]
     public void ResolveHostedPushPrefix_UsesUsernameNamespaceForDockerHub()
     {
-        var prefix = DokployApi.ResolveHostedPushPrefix("docker.io", "octocat", null);
+        var prefix = DokployRegistryService.ResolveHostedPushPrefix("docker.io", "octocat", null);
 
         Assert.Equal("docker.io/octocat", prefix);
     }
@@ -63,7 +65,7 @@ public class DokployRegistrySettingsTests
     [Fact]
     public void ResolveHostedPushPrefix_UsesExistingNamespacedPrefixWhenPresent()
     {
-        var prefix = DokployApi.ResolveHostedPushPrefix("docker.io", "octocat", "docker.io/octocat");
+        var prefix = DokployRegistryService.ResolveHostedPushPrefix("docker.io", "octocat", "docker.io/octocat");
 
         Assert.Equal("docker.io/octocat", prefix);
     }
@@ -71,7 +73,7 @@ public class DokployRegistrySettingsTests
     [Fact]
     public void NormalizeRegistryHost_RemovesSchemeAndSlash()
     {
-        var host = DokployApi.NormalizeRegistryHost("https://docker.io/");
+        var host = DokployRegistryService.NormalizeRegistryHost("https://docker.io/");
 
         Assert.Equal("docker.io", host);
     }

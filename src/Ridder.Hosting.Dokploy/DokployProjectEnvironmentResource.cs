@@ -2,6 +2,8 @@ using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Pipelines;
 using Aspire.Hosting.Publishing;
 using Microsoft.Extensions.DependencyInjection;
+using Ridder.Hosting.Dokploy.Abstractions;
+using Ridder.Hosting.Dokploy.Models;
 
 namespace Ridder.Hosting.Dokploy;
 

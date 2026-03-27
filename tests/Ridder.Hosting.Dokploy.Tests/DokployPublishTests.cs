@@ -3,6 +3,9 @@ using System.Text.Json;
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Publishing;
+using Ridder.Hosting.Dokploy.Annotations;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Services;
 
 namespace Ridder.Hosting.Dokploy.Tests;
 
@@ -169,7 +172,7 @@ public class DokployPublishTests
             ["apiservice"] = "dokploydeploy-app-apiservice-dvbjux"
         };
 
-        var normalized = DokployApi.NormalizeDokployEnvironmentVariables(environmentVariables, applicationHostsByResource);
+        var normalized = DokployApplicationService.NormalizeDokployEnvironmentVariables(environmentVariables, applicationHostsByResource);
 
         Assert.Equal("http://dokploydeploy-app-apiservice-dvbjux:8080", normalized["APISERVICE_HTTP"]);
         Assert.Equal("http://dokploydeploy-app-apiservice-dvbjux:8080", normalized["services__apiservice__http__0"]);
