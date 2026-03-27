@@ -1,7 +1,9 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
-using Ridder.Hosting.Dokploy;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Services;
+using Ridder.Hosting.Dokploy.Utilities;
 
 namespace Ridder.Hosting.Dokploy.Tests;
 
@@ -61,13 +63,13 @@ public class DokployJsonPayloadTests
   [Fact]
   public void GetRegistryUsernameFromCompose_ReadsEnvBackedUsername()
   {
-    var compose = new DokployApi.Compose
+    var compose = new DokployCompose
     {
       Name = "registry",
       Env = "REGISTRY_HTPASSWD_USERNAME=docker\nREGISTRY_HTPASSWD_PASSWORD=supersecret"
     };
 
-    var username = DokployApi.GetRegistryUsernameFromCompose(compose);
+    var username = DokployRegistryService.GetRegistryUsernameFromCompose(compose);
 
     Assert.Equal("docker", username);
   }
@@ -75,13 +77,13 @@ public class DokployJsonPayloadTests
   [Fact]
   public void GetRegistryPasswordFromCompose_ReadsEnvBackedPassword()
   {
-    var compose = new DokployApi.Compose
+    var compose = new DokployCompose
     {
       Name = "registry",
       Env = "REGISTRY_HTPASSWD_USERNAME=docker\nREGISTRY_HTPASSWD_PASSWORD=supersecret"
     };
 
-    var password = DokployApi.GetRegistryPasswordFromCompose(compose);
+    var password = DokployRegistryService.GetRegistryPasswordFromCompose(compose);
 
     Assert.Equal("supersecret", password);
   }

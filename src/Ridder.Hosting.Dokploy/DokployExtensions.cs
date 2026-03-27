@@ -1,10 +1,9 @@
 using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
-using Aspire.Hosting.Eventing;
-using Aspire.Hosting.Publishing;
-using Microsoft.AspNetCore.Builder;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Ridder.Hosting.Dokploy.Abstractions;
+using Ridder.Hosting.Dokploy.Annotations;
+using Ridder.Hosting.Dokploy.Services;
 
 namespace Ridder.Hosting.Dokploy;
 

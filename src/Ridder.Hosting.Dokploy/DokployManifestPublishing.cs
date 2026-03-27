@@ -1,5 +1,6 @@
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Publishing;
+using Ridder.Hosting.Dokploy.Annotations;
 
 namespace Ridder.Hosting.Dokploy;
 

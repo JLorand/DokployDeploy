@@ -2,15 +2,25 @@ using Aspire.Hosting;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Docker;
 using Microsoft.Extensions.Logging;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Utilities;
 using System.Globalization;
-using System.Text;
 using System.Text.Json;
 
-namespace Ridder.Hosting.Dokploy;
+namespace Ridder.Hosting.Dokploy.Services;
 
-internal partial class DokployApi
+internal sealed class DokployApplicationService
 {
-    internal async Task<Application> GetOrCreateApplication(string appName, string projectName)
+    private readonly DokployApiClient _client;
+    private readonly DokployProjectService _projectService;
+
+    internal DokployApplicationService(DokployApiClient client, DokployProjectService projectService)
+    {
+        _client = client;
+        _projectService = projectService;
+    }
+
+    internal async Task<DokployApplication> GetOrCreateApplication(string appName, string projectName)
     {
         if (string.IsNullOrWhiteSpace(appName))
         {
@@ -22,13 +32,13 @@ internal partial class DokployApi
             throw new ArgumentException("Project name must be provided.", nameof(projectName));
         }
 
-        var project = await GetProjectOrCreateAsync(projectName);
+        var project = await _projectService.GetProjectOrCreateAsync(projectName);
         if (string.IsNullOrWhiteSpace(project.Id))
         {
             throw new InvalidOperationException($"Project '{projectName}' does not have a projectId.");
         }
 
-        using var projectResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
+        using var projectResponse = await _client.Http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
         projectResponse.EnsureSuccessStatusCode();
 
         var refreshedProject = await DokployResponseReaders.ReadProjectFromResponseAsync(projectResponse)
@@ -49,7 +59,7 @@ internal partial class DokployApi
 
         if (existing is not null)
         {
-            logger.LogInformation("Application {AppName} already exists in project {ProjectName}.", appName, refreshedProject.Name);
+            _client.Logger.LogInformation("Application {AppName} already exists in project {ProjectName}.", appName, refreshedProject.Name);
             return existing;
         }
 
@@ -59,15 +69,15 @@ internal partial class DokployApi
             appName = appName,
             description = "Created by Aspire deploy pipeline.",
             environmentId = targetEnvironment.Id
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        using var createResponse = await http.PostAsync("api/application.create", CreateJsonContent(createBody));
+        using var createResponse = await _client.Http.PostAsync("api/application.create", DokployApiClient.CreateJsonContent(createBody));
         createResponse.EnsureSuccessStatusCode();
 
         var created = await DokployResponseReaders.ReadApplicationFromResponseAsync(createResponse);
-        logger.LogInformation("Created application {AppName} in project {ProjectName}.", appName, refreshedProject.Name);
+        _client.Logger.LogInformation("Created application {AppName} in project {ProjectName}.", appName, refreshedProject.Name);
 
-        using var verifyResponse = await http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
+        using var verifyResponse = await _client.Http.GetAsync($"api/project.one?projectId={Uri.EscapeDataString(project.Id)}");
         verifyResponse.EnsureSuccessStatusCode();
 
         var verifiedProject = await DokployResponseReaders.ReadProjectFromResponseAsync(verifyResponse)
@@ -96,7 +106,7 @@ internal partial class DokployApi
     }
 
     internal async Task ConfigureApplicationAsync(
-        Application application,
+        DokployApplication application,
         string projectName,
         IComputeResource rsc,
         DistributedApplicationExecutionContext executionContext,
@@ -110,7 +120,7 @@ internal partial class DokployApi
             throw new InvalidOperationException($"Application '{rsc.Name}' has no applicationId, so provider cannot be configured.");
         }
 
-        var registryUrl = GetRegistryUrl();
+        var registryUrl = _client.RegistrySettings.RegistryUrl;
 
         string? dockerImage = null;
 
@@ -133,13 +143,13 @@ internal partial class DokployApi
             applicationId = application.Id,
             registryUrl,
             dockerImage,
-            username = registrySettings.Username,
-            password = registrySettings.Password
-        }, JsonOptions);
+            username = _client.RegistrySettings.Username,
+            password = _client.RegistrySettings.Password
+        }, DokployApiClient.JsonOptions);
 
-        using var saveDockerProviderResponse = await http.PostAsync("api/application.saveDockerProvider", CreateJsonContent(saveDockerProviderBody));
+        using var saveDockerProviderResponse = await _client.Http.PostAsync("api/application.saveDockerProvider", DokployApiClient.CreateJsonContent(saveDockerProviderBody));
         saveDockerProviderResponse.EnsureSuccessStatusCode();
-        logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
+        _client.Logger.LogInformation("Saved docker provider for application {AppName}.", rsc.Name);
 
         if (publishAnnotation?.Options.ConfigureEnvironmentVariables ?? true)
         {
@@ -157,7 +167,7 @@ internal partial class DokployApi
         }
     }
 
-    internal async Task DeployApplicationAsync(Application application, IComputeResource rsc)
+    internal async Task DeployApplicationAsync(DokployApplication application, IComputeResource rsc)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
         {
@@ -168,16 +178,16 @@ internal partial class DokployApi
         {
             applicationId = application.Id,
             title = $"Aspire deployment for {rsc.Name}",
-            description = $"Automated deploy for resource '{rsc.Name}' in project '{env.ApplicationName}'."
-        }, JsonOptions);
+            description = $"Automated deploy for resource '{rsc.Name}' in project '{_client.Env.ApplicationName}'."
+        }, DokployApiClient.JsonOptions);
 
-        using var deployResponse = await http.PostAsync("api/application.deploy", CreateJsonContent(deployBody));
+        using var deployResponse = await _client.Http.PostAsync("api/application.deploy", DokployApiClient.CreateJsonContent(deployBody));
         deployResponse.EnsureSuccessStatusCode();
-        logger.LogInformation("Triggered application deploy for {AppName}.", rsc.Name);
+        _client.Logger.LogInformation("Triggered application deploy for {AppName}.", rsc.Name);
     }
 
     private async Task SaveApplicationEnvironmentAsync(
-        Application application,
+        DokployApplication application,
         string projectName,
         IComputeResource resource,
         DistributedApplicationExecutionContext executionContext,
@@ -192,7 +202,7 @@ internal partial class DokployApi
         var environmentVariables = await ResolveResourceEnvironmentAsync(resource, projectName, executionContext, applicationHostsByResource, cancellationToken);
         if (environmentVariables.Count == 0)
         {
-            logger.LogInformation("No Aspire environment variables found for resource {ResourceName}.", resource.Name);
+            _client.Logger.LogInformation("No Aspire environment variables found for resource {ResourceName}.", resource.Name);
             return;
         }
 
@@ -204,8 +214,8 @@ internal partial class DokployApi
 
         var envKeys = environmentVariables.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase).ToArray();
 
-        logger.LogInformation("Preparing to save {Count} environment variable(s) for resource {ResourceName}. Keys: {EnvironmentKeys}", envKeys.Length, resource.Name, string.Join(", ", envKeys));
-        logger.LogInformation("Environment payload size for resource {ResourceName}: {PayloadLength} characters.", resource.Name, envPayload.Length);
+        _client.Logger.LogInformation("Preparing to save {Count} environment variable(s) for resource {ResourceName}. Keys: {EnvironmentKeys}", envKeys.Length, resource.Name, string.Join(", ", envKeys));
+        _client.Logger.LogInformation("Environment payload size for resource {ResourceName}: {PayloadLength} characters.", resource.Name, envPayload.Length);
 
         var saveEnvironmentBody = JsonSerializer.Serialize(new
         {
@@ -214,14 +224,14 @@ internal partial class DokployApi
             createEnvFile = true,
             buildArgs = "",
             buildSecrets = ""
-        }, JsonOptions);
+        }, DokployApiClient.JsonOptions);
 
-        using var saveEnvironmentResponse = await http.PostAsync("api/application.saveEnvironment", CreateJsonContent(saveEnvironmentBody));
+        using var saveEnvironmentResponse = await _client.Http.PostAsync("api/application.saveEnvironment", DokployApiClient.CreateJsonContent(saveEnvironmentBody));
         saveEnvironmentResponse.EnsureSuccessStatusCode();
-        logger.LogInformation("Saved {Count} environment variable(s) for application {AppName}.", environmentVariables.Count, resource.Name);
+        _client.Logger.LogInformation("Saved {Count} environment variable(s) for application {AppName}.", environmentVariables.Count, resource.Name);
     }
 
-    private async Task EnsureApplicationMountsAsync(Application application, IComputeResource resource)
+    private async Task EnsureApplicationMountsAsync(DokployApplication application, IComputeResource resource)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
         {
@@ -230,7 +240,7 @@ internal partial class DokployApi
 
         if (!resource.TryGetContainerMounts(out var containerMounts))
         {
-            logger.LogInformation("Application {AppName} has no Aspire container mounts. Skipping mount creation.", resource.Name);
+            _client.Logger.LogInformation("Application {AppName} has no Aspire container mounts. Skipping mount creation.", resource.Name);
             return;
         }
 
@@ -241,15 +251,15 @@ internal partial class DokployApi
 
         if (desiredMounts.Count == 0)
         {
-            logger.LogInformation("Application {AppName} has no supported Aspire container mounts after normalization. Skipping mount creation.", resource.Name);
+            _client.Logger.LogInformation("Application {AppName} has no supported Aspire container mounts after normalization. Skipping mount creation.", resource.Name);
             return;
         }
 
-        using var existingMountsResponse = await http.GetAsync($"api/mounts.allNamedByApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
+        using var existingMountsResponse = await _client.Http.GetAsync($"api/mounts.allNamedByApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
         existingMountsResponse.EnsureSuccessStatusCode();
 
-        var existingMounts = await DokployResponseReaders.ReadMountsFromResponseAsync(existingMountsResponse, logger);
-        var unmatchedExistingMounts = new List<Mount>(existingMounts);
+        var existingMounts = await DokployResponseReaders.ReadMountsFromResponseAsync(existingMountsResponse, _client.Logger);
+        var unmatchedExistingMounts = new List<DokployMount>(existingMounts);
 
         foreach (var desiredMount in desiredMounts)
         {
@@ -257,7 +267,7 @@ internal partial class DokployApi
             if (exactMatch is not null)
             {
                 unmatchedExistingMounts.Remove(exactMatch);
-                logger.LogInformation("Mount {MountPath} for application {AppName} already exists as {MountType}.", desiredMount.MountPath, resource.Name, desiredMount.Type);
+                _client.Logger.LogInformation("Mount {MountPath} for application {AppName} already exists as {MountType}.", desiredMount.MountPath, resource.Name, desiredMount.Type);
                 continue;
             }
 
@@ -280,12 +290,12 @@ internal partial class DokployApi
                     mountPath = desiredMount.MountPath,
                     serviceType = "application",
                     applicationId = application.Id
-                }, JsonOptions);
+                }, DokployApiClient.JsonOptions);
 
-                using var updateResponse = await http.PostAsync("api/mounts.update", CreateJsonContent(updateBody));
+                using var updateResponse = await _client.Http.PostAsync("api/mounts.update", DokployApiClient.CreateJsonContent(updateBody));
                 updateResponse.EnsureSuccessStatusCode();
 
-                logger.LogInformation("Updated mount {MountPath} for application {AppName} to {MountType}.", desiredMount.MountPath, resource.Name, desiredMount.Type);
+                _client.Logger.LogInformation("Updated mount {MountPath} for application {AppName} to {MountType}.", desiredMount.MountPath, resource.Name, desiredMount.Type);
                 continue;
             }
 
@@ -297,20 +307,20 @@ internal partial class DokployApi
                 mountPath = desiredMount.MountPath,
                 serviceType = "application",
                 serviceId = application.Id
-            }, JsonOptions);
+            }, DokployApiClient.JsonOptions);
 
-            using var createResponse = await http.PostAsync("api/mounts.create", CreateJsonContent(createBody));
+            using var createResponse = await _client.Http.PostAsync("api/mounts.create", DokployApiClient.CreateJsonContent(createBody));
             createResponse.EnsureSuccessStatusCode();
-            logger.LogInformation("Created mount {MountPath} for application {AppName} as {MountType}.", desiredMount.MountPath, resource.Name, desiredMount.Type);
+            _client.Logger.LogInformation("Created mount {MountPath} for application {AppName} as {MountType}.", desiredMount.MountPath, resource.Name, desiredMount.Type);
         }
 
         if (unmatchedExistingMounts.Count > 0)
         {
-            logger.LogInformation("Application {AppName} has {ExtraCount} extra existing Dokploy mount(s) beyond the {ExpectedCount} Aspire mount(s); leaving them unchanged.", resource.Name, unmatchedExistingMounts.Count, desiredMounts.Count);
+            _client.Logger.LogInformation("Application {AppName} has {ExtraCount} extra existing Dokploy mount(s) beyond the {ExpectedCount} Aspire mount(s); leaving them unchanged.", resource.Name, unmatchedExistingMounts.Count, desiredMounts.Count);
         }
     }
 
-    private DokployMountSpec ToDesiredMount(IComputeResource resource, ContainerMountAnnotation mount)
+    private static DokployMountSpec ToDesiredMount(IComputeResource resource, ContainerMountAnnotation mount)
     {
         if (mount.IsReadOnly)
         {
@@ -337,12 +347,12 @@ internal partial class DokployApi
         return DokployMountReconciler.GetMountIdentity(mount.Type, mount.MountPath, mount.HostPath, mount.VolumeName);
     }
 
-    private static bool MountIdentityMatches(Mount existingMount, DokployMountSpec desiredMount)
+    private static bool MountIdentityMatches(DokployMount existingMount, DokployMountSpec desiredMount)
     {
         return DokployMountReconciler.MountIdentityMatches(existingMount, desiredMount.Type, desiredMount.MountPath, desiredMount.HostPath, desiredMount.VolumeName);
     }
 
-    private static bool MountLocationMatches(Mount existingMount, DokployMountSpec desiredMount)
+    private static bool MountLocationMatches(DokployMount existingMount, DokployMountSpec desiredMount)
     {
         return DokployMountReconciler.MountLocationMatches(existingMount, desiredMount.MountPath);
     }
@@ -383,7 +393,7 @@ internal partial class DokployApi
 
         if (normalized.Count != materialized.Count)
         {
-            logger.LogInformation(
+            _client.Logger.LogInformation(
                 "Removed {RemovedCount} invalid internal HTTPS environment variable(s) for resource {ResourceName} because Dokploy service-to-service traffic is published as HTTP.",
                 materialized.Count - normalized.Count,
                 resource.Name);
@@ -589,7 +599,7 @@ internal partial class DokployApi
         return $"\"{normalized.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal)}\"";
     }
 
-    private async Task EnsureApplicationDomainAsync(Application application, IComputeResource resource)
+    private async Task EnsureApplicationDomainAsync(DokployApplication application, IComputeResource resource)
     {
         if (string.IsNullOrWhiteSpace(application.Id))
         {
@@ -599,29 +609,29 @@ internal partial class DokployApi
         var externalEndpoints = GetExternalEndpoints(resource);
         if (externalEndpoints.Count == 0)
         {
-            logger.LogInformation("Application {AppName} has no external Aspire endpoints. Skipping domain creation.", application.AppName);
+            _client.Logger.LogInformation("Application {AppName} has no external Aspire endpoints. Skipping domain creation.", application.AppName);
             return;
         }
 
-        using var byAppResponse = await http.GetAsync($"api/domain.byApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
+        using var byAppResponse = await _client.Http.GetAsync($"api/domain.byApplicationId?applicationId={Uri.EscapeDataString(application.Id)}");
         byAppResponse.EnsureSuccessStatusCode();
 
-        var existingDomains = await DokployResponseReaders.ReadDomainsFromResponseAsync(byAppResponse, logger, "domain.byApplicationId");
+        var existingDomains = await DokployResponseReaders.ReadDomainsFromResponseAsync(byAppResponse, _client.Logger, "domain.byApplicationId");
         var appNameForDomain = string.IsNullOrWhiteSpace(application.AppName) ? application.Name : application.AppName;
         if (string.IsNullOrWhiteSpace(appNameForDomain))
         {
             throw new InvalidOperationException("Application name is required to generate a domain.");
         }
 
-        var generateBody = JsonSerializer.Serialize(new { appName = appNameForDomain }, JsonOptions);
+        var generateBody = JsonSerializer.Serialize(new { appName = appNameForDomain }, DokployApiClient.JsonOptions);
 
-        using var generateResponse = await http.PostAsync("api/domain.generateDomain", CreateJsonContent(generateBody));
+        using var generateResponse = await _client.Http.PostAsync("api/domain.generateDomain", DokployApiClient.CreateJsonContent(generateBody));
         generateResponse.EnsureSuccessStatusCode();
 
-        var generatedHost = await DokployResponseReaders.ReadGeneratedHostFromResponseAsync(generateResponse, logger)
+        var generatedHost = await DokployResponseReaders.ReadGeneratedHostFromResponseAsync(generateResponse, _client.Logger)
             ?? throw new InvalidOperationException($"Could not parse generated domain host for application '{appNameForDomain}'.");
 
-        var unmatchedDomains = new List<Domain>(existingDomains);
+        var unmatchedDomains = new List<DokployDomain>(existingDomains);
 
         foreach (var endpoint in externalEndpoints)
         {
@@ -646,12 +656,12 @@ internal partial class DokployApi
                     port = endpoint.Port,
                     https = endpoint.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase),
                     domainType = "application"
-                }, JsonOptions);
+                }, DokployApiClient.JsonOptions);
 
-                using var updateResponse = await http.PostAsync("api/domain.update", CreateJsonContent(updateBody));
+                using var updateResponse = await _client.Http.PostAsync("api/domain.update", DokployApiClient.CreateJsonContent(updateBody));
                 updateResponse.EnsureSuccessStatusCode();
 
-                logger.LogInformation("Updated deployed application URL {EndpointUrl} for application {AppName} using endpoint {EndpointName}.", endpointUrl, appNameForDomain, endpoint.Name);
+                _client.Logger.LogInformation("Updated deployed application URL {EndpointUrl} for application {AppName} using endpoint {EndpointName}.", endpointUrl, appNameForDomain, endpoint.Name);
                 continue;
             }
 
@@ -662,17 +672,17 @@ internal partial class DokployApi
                 port = endpoint.Port,
                 https = endpoint.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase),
                 domainType = "application"
-            }, JsonOptions);
+            }, DokployApiClient.JsonOptions);
 
-            using var createResponse = await http.PostAsync("api/domain.create", CreateJsonContent(createBody));
+            using var createResponse = await _client.Http.PostAsync("api/domain.create", DokployApiClient.CreateJsonContent(createBody));
             createResponse.EnsureSuccessStatusCode();
 
-            logger.LogInformation("Created deployed application URL {EndpointUrl} for application {AppName} using endpoint {EndpointName}.", endpointUrl, appNameForDomain, endpoint.Name);
+            _client.Logger.LogInformation("Created deployed application URL {EndpointUrl} for application {AppName} using endpoint {EndpointName}.", endpointUrl, appNameForDomain, endpoint.Name);
         }
 
         if (unmatchedDomains.Count > 0)
         {
-            logger.LogInformation("Application {AppName} has {ExtraCount} extra existing domain(s) beyond the {ExpectedCount} external Aspire endpoint(s); leaving them unchanged.", appNameForDomain, unmatchedDomains.Count, externalEndpoints.Count);
+            _client.Logger.LogInformation("Application {AppName} has {ExtraCount} extra existing domain(s) beyond the {ExpectedCount} external Aspire endpoint(s); leaving them unchanged.", appNameForDomain, unmatchedDomains.Count, externalEndpoints.Count);
         }
     }
 

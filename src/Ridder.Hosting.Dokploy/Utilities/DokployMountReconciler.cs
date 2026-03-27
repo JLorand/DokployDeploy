@@ -1,4 +1,6 @@
-namespace Ridder.Hosting.Dokploy;
+using Ridder.Hosting.Dokploy.Models;
+
+namespace Ridder.Hosting.Dokploy.Utilities;
 
 internal static class DokployMountReconciler
 {
@@ -13,7 +15,7 @@ internal static class DokployMountReconciler
         return $"{normalizedType}|{normalizedMountPath}|{normalizedBackingPath}";
     }
 
-    public static bool MountIdentityMatches(DokployApi.Mount existingMount, string type, string mountPath, string? hostPath, string? volumeName)
+    public static bool MountIdentityMatches(DokployMount existingMount, string type, string mountPath, string? hostPath, string? volumeName)
     {
         ArgumentNullException.ThrowIfNull(existingMount);
 
@@ -21,7 +23,7 @@ internal static class DokployMountReconciler
             == GetMountIdentity(type, mountPath, hostPath, volumeName);
     }
 
-    public static bool MountLocationMatches(DokployApi.Mount existingMount, string mountPath)
+    public static bool MountLocationMatches(DokployMount existingMount, string mountPath)
     {
         ArgumentNullException.ThrowIfNull(existingMount);
 

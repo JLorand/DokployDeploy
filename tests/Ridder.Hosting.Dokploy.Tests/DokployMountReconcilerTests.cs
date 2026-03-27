@@ -1,4 +1,5 @@
-using Ridder.Hosting.Dokploy;
+using Ridder.Hosting.Dokploy.Models;
+using Ridder.Hosting.Dokploy.Utilities;
 
 namespace Ridder.Hosting.Dokploy.Tests;
 
@@ -7,7 +8,7 @@ public class DokployMountReconcilerTests
     [Fact]
     public void MountLocationMatches_IgnoresTrailingSlashAndTypeShape()
     {
-        var existingMount = new DokployApi.Mount
+        var existingMount = new DokployMount
         {
             Type = "volume-mount",
             MountPath = "/data/"
@@ -21,7 +22,7 @@ public class DokployMountReconcilerTests
     [Fact]
     public void MountIdentityMatches_NormalizesVolumeTypeAliases()
     {
-        var existingMount = new DokployApi.Mount
+        var existingMount = new DokployMount
         {
             Type = "volume-mount",
             MountPath = "/data/",
